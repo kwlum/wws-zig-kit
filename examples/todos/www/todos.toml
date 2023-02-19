@@ -1,0 +1,6 @@
+name = "todos"
+version = "1"
+
+[data]
+[data.kv]
+namespace = "todos"
