@@ -22,23 +22,26 @@ pub const Response = struct {
     body: std.ArrayList(u8).Writer,
 };
 
-pub fn run(allocator: std.mem.Allocator, max_request_size: usize, handler: anytype) !void {
+pub fn run(comptime T: type, ctx: T, allocator: std.mem.Allocator, max_request_size: usize, handler: anytype) !void {
     const handler_type_info = @typeInfo(@TypeOf(handler));
 
     if (handler_type_info != .Fn) @compileError("handler is not a function.");
 
     const handler_fn = handler_type_info.Fn;
 
-    if (handler_fn.args.len != 3) @compileError("handler requires 3 arguments.");
+    if (handler_fn.args.len != 4) @compileError("handler requires 4 arguments.");
 
-    if (handler_fn.args[0].arg_type orelse void != Request)
-        @compileError("handler first argument is not Request.");
+    if (handler_fn.args[0].arg_type orelse void != T)
+        @compileError("handler first argument is not T.");
 
-    if (handler_fn.args[1].arg_type orelse void != *Response)
-        @compileError("handler second argument is not *Response.");
+    if (handler_fn.args[1].arg_type orelse void != Request)
+        @compileError("handler second argument is not Request.");
 
-    if (handler_fn.args[2].arg_type orelse void != *Cache)
-        @compileError("handler third argument is not *std.StringHashMap([]const u8).");
+    if (handler_fn.args[2].arg_type orelse void != *Response)
+        @compileError("handler third argument is not *Response.");
+
+    if (handler_fn.args[3].arg_type orelse void != *Cache)
+        @compileError("handler fourth argument is not *Cache.");
 
     const r = handler_fn.return_type.?;
     const r_info = @typeInfo(r);
@@ -54,7 +57,17 @@ pub fn run(allocator: std.mem.Allocator, max_request_size: usize, handler: anyty
     try Input.fromStdIn(arena.allocator(), &input, max_request_size);
     try Output.init(arena.allocator(), &output);
 
-    try @call(.{}, handler, .{ input.request, &output.response, &input.cache });
+    @call(.{}, handler, .{ ctx, input.request, &output.response, &input.cache }) catch |err| {
+        output.response.status = http.Status.internal_server_error;
+
+        output.response.headers.clearAndFree();
+        try output.response.headers.put("content-type", "text/plain");
+
+        output.data.clearAndFree();
+        var writer = output.data.writer();
+        try writer.writeAll("Internal Server Error! ");
+        try writer.print("Error: {}", .{err});
+    };
 
     // Write output to stdout.
     try output.toStdOut(&input.cache);
@@ -128,11 +141,6 @@ const Input = struct {
             input.request.method = http.Method.PATCH;
         }
     }
-
-    // pub fn deinit(self: *Input) void {
-    //     self.arena.deinit();
-    //     self.* = undefined;
-    // }
 };
 
 const Output = struct {
@@ -147,21 +155,7 @@ const Output = struct {
         output.response.status = http.Status.ok;
         output.response.headers = Headers.init(allocator);
         output.response.body = output.data.writer();
-
-        // return .{
-        //     .data = data,
-        //     .response = response,
-        //     .allocator = allocator,
-        // };
     }
-
-    // pub fn deinit(self: *Output) void {
-    //     self.response.deinit();
-    //     self.data.deinit();
-    //     self.allocator.destroy(self.response);
-    //     self.allocator.destroy(self.data);
-    //     self.* = undefined;
-    // }
 
     fn toStdOut(self: *Output, cache: *const Cache) !void {
         const stdout_writer = std.io.getStdOut().writer();
