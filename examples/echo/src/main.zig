@@ -1,19 +1,14 @@
 const std = @import("std");
+const http = std.http;
 
 const kit = @import("wws-zig-kit");
 
+fn handle(_: void, request: kit.Request, response: *kit.Response, _: *kit.Cache) !void {
+    try response.headers.put("content-type", "text/plain");
+    try response.body.writeAll(request.body);
+    response.status = http.Status.ok;
+}
+
 pub fn main() !void {
-    var allocator = std.heap.page_allocator;
-
-    // Initialize Input and Output.
-    var input = try kit.Input.fromStdIn(allocator, 65536);
-    defer input.deinit();
-    var output = try kit.Output.init(allocator, input);
-    defer output.deinit();
-
-    // Echo
-    output.data = input.body;
-
-    // Write output to stdout.
-    try output.toStdOut();
+    try kit.run(void, {}, std.heap.c_allocator, 65536, handle);
 }

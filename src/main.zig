@@ -5,106 +5,171 @@ const http = std.http;
 const json = std.json;
 const mem = std.mem;
 
-pub const Input = struct {
-    url: []const u8,
+pub const Cache = std.StringHashMap([]const u8);
+pub const Headers = std.StringHashMap([]const u8);
+
+pub const Request = struct {
     method: http.Method,
+    headers: Headers,
+    path: []const u8,
+    query: []const u8,
     body: []const u8,
-    headers: std.StringHashMap([]const u8),
-    kv: std.StringHashMap([]const u8),
-    arena: std.heap.ArenaAllocator,
+};
 
-    pub fn fromStdIn(inner_allocator: mem.Allocator, max_size: usize) !Input {
-        var input: Input = .{
-            .url = "",
-            .method = http.Method.GET,
-            .body = "",
-            .headers = undefined,
-            .kv = undefined,
-            .arena = std.heap.ArenaAllocator.init(inner_allocator),
-        };
+pub const Response = struct {
+    status: http.Status,
+    headers: Headers,
+    body: std.ArrayList(u8).Writer,
+};
 
-        var allocator = input.arena.allocator();
+pub fn run(comptime T: type, ctx: T, allocator: std.mem.Allocator, max_request_size: usize, handler: anytype) !void {
+    const handler_type_info = @typeInfo(@TypeOf(handler));
+
+    if (handler_type_info != .Fn) @compileError("handler is not a function.");
+
+    const handler_fn = handler_type_info.Fn;
+
+    if (handler_fn.args.len != 4) @compileError("handler requires 4 arguments.");
+
+    if (handler_fn.args[0].arg_type orelse void != T)
+        @compileError("handler first argument is not T.");
+
+    if (handler_fn.args[1].arg_type orelse void != Request)
+        @compileError("handler second argument is not Request.");
+
+    if (handler_fn.args[2].arg_type orelse void != *Response)
+        @compileError("handler third argument is not *Response.");
+
+    if (handler_fn.args[3].arg_type orelse void != *Cache)
+        @compileError("handler fourth argument is not *Cache.");
+
+    const r = handler_fn.return_type.?;
+    const r_info = @typeInfo(r);
+    if (r != void and (r_info != .ErrorUnion or r_info.ErrorUnion.payload != void))
+        @compileError("handle return type is not !void");
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    // Initialize Input and Output.
+    var input: Input = undefined;
+    var output: Output = undefined;
+    try Input.fromStdIn(arena.allocator(), &input, max_request_size);
+    try Output.init(arena.allocator(), &output);
+
+    @call(.{}, handler, .{ ctx, input.request, &output.response, &input.cache }) catch |err| {
+        output.response.status = http.Status.internal_server_error;
+
+        output.response.headers.clearAndFree();
+        try output.response.headers.put("content-type", "text/plain");
+
+        output.data.clearAndFree();
+        var writer = output.data.writer();
+        try writer.writeAll("Internal Server Error! ");
+        try writer.print("Error: {}", .{err});
+    };
+
+    // Write output to stdout.
+    try output.toStdOut(&input.cache);
+}
+
+const Input = struct {
+    request: Request,
+    cache: Cache,
+
+    fn fromStdIn(allocator: mem.Allocator, input: *Input, max_size: usize) !void {
+        // Parse Input json string from stdin.
         const stdin = std.io.getStdIn().reader();
         const input_string = try stdin.readAllAlloc(allocator, max_size);
         var json_parser = json.Parser.init(allocator, false);
-        var json_tree = try json_parser.parse(input_string);
+        const json_tree = try json_parser.parse(input_string);
 
-        input.url = json_tree.root.Object.get("url").?.String;
-        input.body = json_tree.root.Object.get("body").?.String;
-        input.headers = std.StringHashMap([]const u8).init(allocator);
-        input.kv = std.StringHashMap([]const u8).init(allocator);
-
-        const method_string = json_tree.root.Object.get("method").?.String;        
-        if (ascii.eqlIgnoreCase(method_string, "head")) {
-            input.method = http.Method.HEAD;
-        } else if (ascii.eqlIgnoreCase(method_string, "post")) {
-            input.method = http.Method.POST;
-        } else if (ascii.eqlIgnoreCase(method_string, "put")) {
-            input.method = http.Method.PUT;
-        } else if (ascii.eqlIgnoreCase(method_string, "delete")) {
-            input.method = http.Method.DELETE;
-        } else if (ascii.eqlIgnoreCase(method_string, "connect")) {
-            input.method = http.Method.CONNECT;
-        } else if (ascii.eqlIgnoreCase(method_string, "options")) {
-            input.method = http.Method.OPTIONS;
-        } else if (ascii.eqlIgnoreCase(method_string, "trace")) {
-            input.method = http.Method.TRACE;
-        } else if (ascii.eqlIgnoreCase(method_string, "patch")) {
-            input.method = http.Method.PATCH;
-        }
-
-        var tree_headers = json_tree.root.Object.get("headers").?.Object;
-        var tree_headers_keys = tree_headers.keys();
-        for (tree_headers_keys) |header_key| {
-            try input.headers.put(header_key, tree_headers.get(header_key).?.String);
-        }
-
-        var tree_kv = json_tree.root.Object.get("kv").?.Object;
-        var tree_kv_keys = tree_kv.keys();
+        // Populate cache.
+        input.cache = Cache.init(allocator);
+        const tree_kv = json_tree.root.Object.get("kv").?.Object;
+        const tree_kv_keys = tree_kv.keys();
+        std.debug.print("in kv len: '{d}''\n", .{tree_kv_keys.len});
         for (tree_kv_keys) |kv_key| {
-            try input.kv.put(kv_key, tree_kv.get(kv_key).?.String);
+            std.debug.print("in kv: '{s}''\n", .{kv_key});
+            try input.cache.put(kv_key, tree_kv.get(kv_key).?.String);
         }
 
-        return input;
-    }
+        // Construct Request.
+        const request_path = if (json_tree.root.Object.get("url")) |a| a.String else "/";
+        const request_body = if (json_tree.root.Object.get("body")) |a| a.String else "";
+        input.request = .{
+            .method = http.Method.GET,
+            .headers = Headers.init(allocator),
+            .path = request_path,
+            .query = "",
+            .body = request_body,
+        };
 
-    pub fn deinit(self: *Input) void {
-        self.arena.deinit();
-        self.* = undefined;
+        std.debug.print("input body: '{s}'\n", .{request_body});
+
+        // Populate Request Headers.
+        const tree_headers = json_tree.root.Object.get("headers").?.Object;
+        const tree_headers_keys = tree_headers.keys();
+        for (tree_headers_keys) |header_key| {
+            try input.request.headers.put(header_key, tree_headers.get(header_key).?.String);
+        }
+
+        // Determine Request Method.
+        var method_buffer: [16]u8 = undefined;
+        const method_string = if (json_tree.root.Object.get("method")) |a|
+            ascii.lowerString(&method_buffer, a.String)
+        else
+            "get";
+
+        if (mem.eql(u8, method_string, "get")) {
+            input.request.method = http.Method.GET;
+        } else if (mem.eql(u8, method_string, "head")) {
+            input.request.method = http.Method.HEAD;
+        } else if (mem.eql(u8, method_string, "post")) {
+            input.request.method = http.Method.POST;
+        } else if (mem.eql(u8, method_string, "put")) {
+            input.request.method = http.Method.PUT;
+        } else if (mem.eql(u8, method_string, "delete")) {
+            input.request.method = http.Method.DELETE;
+        } else if (mem.eql(u8, method_string, "connect")) {
+            input.request.method = http.Method.CONNECT;
+        } else if (mem.eql(u8, method_string, "options")) {
+            input.request.method = http.Method.OPTIONS;
+        } else if (mem.eql(u8, method_string, "trace")) {
+            input.request.method = http.Method.TRACE;
+        } else if (mem.eql(u8, method_string, "patch")) {
+            input.request.method = http.Method.PATCH;
+        }
     }
 };
 
-pub const Output = struct {
-    data: []const u8 = "",
-    headers: std.StringHashMap([]const u8),
-    kv: std.StringHashMap([]const u8),
-    status: http.Status = http.Status.ok,
+const Output = struct {
+    data: std.ArrayList(u8),
+    response: Response,
     base64: bool = false,
 
-    pub fn init(allocator: mem.Allocator, input: Input) !Output {        
-        const kv = try input.kv.cloneWithAllocator(allocator);
+    fn init(allocator: mem.Allocator, output: *Output) !void {
+        output.base64 = false;
+        output.data = std.ArrayList(u8).init(allocator);
 
-        return .{
-            .headers = std.StringHashMap([]const u8).init(allocator),
-            .kv = kv,
-        };
+        output.response.status = http.Status.ok;
+        output.response.headers = Headers.init(allocator);
+        output.response.body = output.data.writer();
     }
 
-    pub fn deinit(self: *Output) void {
-        self.headers.deinit();
-        self.kv.deinit();
-        self.* = undefined;
-    }
-
-    pub fn toStdOut(self: Output) !void {
+    fn toStdOut(self: *Output, cache: *const Cache) !void {
         const stdout_writer = std.io.getStdOut().writer();
         var buffered_writer = std.io.bufferedWriter(stdout_writer);
         const stdout = buffered_writer.writer();
-        try stdout.print("{{\"status\":{},\"base64\":{},", .{ @enumToInt(self.status), self.base64 });
 
-        const headers_len = self.headers.count();
+        // Write base64 and status.
+        try stdout.print("{{\"status\":{d},\"base64\":{},", .{ @enumToInt(self.response.status), self.base64 });
+
+        // Write headers.
+        const headers_len = self.response.headers.count();
+        std.debug.print("header len: {d}\n", .{headers_len});
         var i: usize = 0;
-        var headers_entry_itr = self.headers.iterator();
+        var headers_entry_itr = self.response.headers.iterator();
         _ = try stdout.write("\"headers\":{");
         while (headers_entry_itr.next()) |entry| {
             try json.encodeJsonString(entry.key_ptr.*, .{}, stdout);
@@ -119,16 +184,19 @@ pub const Output = struct {
         }
         _ = try stdout.write("},");
 
-        const kv_len = self.kv.count();
+        // Write KV.
         i = 0;
-        var kv_entry_itr = self.kv.iterator();
+        const cache_len = cache.count();
+        std.debug.print("out cache: {}\n", .{cache_len});
+        var cache_entry_itr = cache.iterator();
         _ = try stdout.write("\"kv\":{");
-        while (kv_entry_itr.next()) |entry| {
+        while (cache_entry_itr.next()) |entry| {
+            std.debug.print("out kv: '{s}' '{s}'\n", .{ entry.key_ptr.*, entry.value_ptr.* });
             try json.encodeJsonString(entry.key_ptr.*, .{}, stdout);
             _ = try stdout.write(":");
             try json.encodeJsonString(entry.value_ptr.*, .{}, stdout);
 
-            if (i < kv_len - 1) {
+            if (i < cache_len - 1) {
                 _ = try stdout.write(",");
             }
 
@@ -136,9 +204,12 @@ pub const Output = struct {
         }
         _ = try stdout.write("},");
 
+        // Write data.
         _ = try stdout.write("\"data\":");
-        try json.encodeJsonString(self.data, .{}, stdout);
+        try json.encodeJsonString(self.data.items, .{}, stdout);
         _ = try stdout.write("}");
+
+        std.debug.print("out body: '{s}'\n", .{self.data.items});
 
         try buffered_writer.flush();
     }
