@@ -7,10 +7,12 @@ const mem = std.mem;
 
 pub const Cache = std.StringHashMap([]const u8);
 pub const Headers = std.StringHashMap([]const u8);
+pub const Params = std.StringHashMap([]const u8);
 
 pub const Request = struct {
     method: http.Method,
     headers: Headers,
+    params: Params,
     path: []const u8,
     query: []const u8,
     body: []const u8,
@@ -88,9 +90,7 @@ const Input = struct {
         input.cache = Cache.init(allocator);
         const tree_kv = json_tree.root.Object.get("kv").?.Object;
         const tree_kv_keys = tree_kv.keys();
-        std.debug.print("in kv len: '{d}''\n", .{tree_kv_keys.len});
         for (tree_kv_keys) |kv_key| {
-            std.debug.print("in kv: '{s}''\n", .{kv_key});
             try input.cache.put(kv_key, tree_kv.get(kv_key).?.String);
         }
 
@@ -100,12 +100,20 @@ const Input = struct {
         input.request = .{
             .method = http.Method.GET,
             .headers = Headers.init(allocator),
+            .params = Params.init(allocator),
             .path = request_path,
             .query = "",
             .body = request_body,
         };
 
-        std.debug.print("input body: '{s}'\n", .{request_body});
+        // Populate request params.
+        if (json_tree.root.Object.get("params")) |a| {
+            const params_tree = a.Object;
+            const params_tree_keys = params_tree.keys();
+            for (params_tree_keys) |key| {
+                try input.request.params.put(key, params_tree.get(key).?.String);
+            }
+        }
 
         // Populate Request Headers.
         const tree_headers = json_tree.root.Object.get("headers").?.Object;
@@ -167,7 +175,6 @@ const Output = struct {
 
         // Write headers.
         const headers_len = self.response.headers.count();
-        std.debug.print("header len: {d}\n", .{headers_len});
         var i: usize = 0;
         var headers_entry_itr = self.response.headers.iterator();
         _ = try stdout.write("\"headers\":{");
@@ -187,11 +194,9 @@ const Output = struct {
         // Write KV.
         i = 0;
         const cache_len = cache.count();
-        std.debug.print("out cache: {}\n", .{cache_len});
         var cache_entry_itr = cache.iterator();
         _ = try stdout.write("\"kv\":{");
         while (cache_entry_itr.next()) |entry| {
-            std.debug.print("out kv: '{s}' '{s}'\n", .{ entry.key_ptr.*, entry.value_ptr.* });
             try json.encodeJsonString(entry.key_ptr.*, .{}, stdout);
             _ = try stdout.write(":");
             try json.encodeJsonString(entry.value_ptr.*, .{}, stdout);
@@ -208,8 +213,6 @@ const Output = struct {
         _ = try stdout.write("\"data\":");
         try json.encodeJsonString(self.data.items, .{}, stdout);
         _ = try stdout.write("}");
-
-        std.debug.print("out body: '{s}'\n", .{self.data.items});
 
         try buffered_writer.flush();
     }
