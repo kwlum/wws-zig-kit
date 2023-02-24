@@ -9,6 +9,179 @@ pub const Cache = std.StringHashMap([]const u8);
 pub const Headers = std.StringHashMap([]const u8);
 pub const Params = std.StringHashMap([]const u8);
 
+pub fn Route(comptime Context: type) type {
+    return struct {
+        allocator: mem.Allocator,
+        max_request_size: usize,
+
+        const Self = @This();
+        const HandleFn = fn (Context, Request, *Response, *Cache) anyerror!void;
+
+        const HandlerType = enum {
+            all,
+            specific,
+        };
+
+        const Handler = struct {
+            handle_fn: HandleFn,
+            method: http.Method,
+            handler_type: HandlerType,
+        };
+
+        pub fn init(allocator: mem.Allocator, max_request_size: usize) Self {
+            return .{
+                .allocator = allocator,
+                .max_request_size = max_request_size,
+            };
+        }
+
+        pub fn run(self: *const Self, ctx: Context, handlers: anytype) !void {
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
+
+            // Initialize Input and Output.
+            var input: Input = undefined;
+            var output: Output = undefined;
+            try Input.fromStdIn(arena.allocator(), &input, self.max_request_size);
+            try Output.init(arena.allocator(), &output);
+
+            // Match the request method and invoke specific handler.
+            // Lookup the type all handler.
+            var not_found = true;
+            comptime var type_all_handler: ?Handler = null;
+            inline for (handlers) |handler| {
+                switch (handler.handler_type) {
+                    .specific => {
+                        if (handler.method == input.request.method) {
+                            not_found = false;
+                            @call(.{}, handler.handle_fn, .{ ctx, input.request, &output.response, &input.cache }) catch |err| {
+                                try renderErrorResponse(&output, err);
+                            };
+                        }
+                    },
+                    .all => type_all_handler = handler,
+                }
+            }
+
+            // Invoke the type all handler or render default not found response.
+            if (not_found) {
+                if (type_all_handler) |handler| {
+                    @call(.{}, handler.handle_fn, .{ ctx, input.request, &output.response, &input.cache }) catch |err| {
+                        try renderErrorResponse(&output, err);
+                    };
+                } else {
+                    try renderNotFoundResponse(&output);
+                }
+            }
+
+            // Write output to stdout.
+            try output.toStdOut(&input.cache);
+        }
+
+        pub fn all(comptime handle_fn: HandleFn) Handler {
+            return .{
+                .handle_fn = handle_fn,
+                .method = http.Method.GET,
+                .handler_type = .all,
+            };
+        }
+
+        pub fn get(comptime handle_fn: HandleFn) Handler {
+            return .{
+                .handle_fn = handle_fn,
+                .method = http.Method.GET,
+                .handler_type = .specific,
+            };
+        }
+
+        pub fn post(comptime handle_fn: HandleFn) Handler {
+            return .{
+                .handle_fn = handle_fn,
+                .method = http.Method.POST,
+                .handler_type = .specific,
+            };
+        }
+
+        pub fn put(comptime handle_fn: HandleFn) Handler {
+            return .{
+                .handle_fn = handle_fn,
+                .method = http.Method.PUT,
+                .handler_type = .specific,
+            };
+        }
+
+        pub fn delete(comptime handle_fn: HandleFn) Handler {
+            return .{
+                .handle_fn = handle_fn,
+                .method = http.Method.DELETE,
+                .handler_type = .specific,
+            };
+        }
+
+        pub fn head(comptime handle_fn: HandleFn) Handler {
+            return .{
+                .handle_fn = handle_fn,
+                .method = http.Method.HEAD,
+                .handler_type = .specific,
+            };
+        }
+
+        pub fn patch(comptime handle_fn: HandleFn) Handler {
+            return .{
+                .handle_fn = handle_fn,
+                .method = http.Method.PATCH,
+                .handler_type = .specific,
+            };
+        }
+
+        pub fn connect(comptime handle_fn: HandleFn) Handler {
+            return .{
+                .handle_fn = handle_fn,
+                .method = http.Method.CONNECT,
+                .handler_type = .specific,
+            };
+        }
+
+        pub fn options(comptime handle_fn: HandleFn) Handler {
+            return .{
+                .handle_fn = handle_fn,
+                .method = http.Method.OPTIONS,
+                .handler_type = .specific,
+            };
+        }
+
+        pub fn trace(comptime handle_fn: HandleFn) Handler {
+            return .{
+                .handle_fn = handle_fn,
+                .method = http.Method.TRACE,
+                .handler_type = .specific,
+            };
+        }
+
+        fn renderErrorResponse(output: *Output, err: anyerror) !void {
+            output.response.status = http.Status.internal_server_error;
+
+            output.response.headers.clearAndFree();
+            try output.response.headers.put("content-type", "text/plain");
+
+            output.data.clearAndFree();
+            var writer = output.data.writer();
+            try writer.writeAll("500 - Internal Server Error. ");
+            try writer.print("Error: {}", .{err});
+        }
+
+        fn renderNotFoundResponse(output: *Output) !void {
+            output.response.status = http.Status.not_found;
+
+            output.response.headers.clearAndFree();
+            try output.response.headers.put("content-type", "text/html");
+
+            output.data.clearAndFree();
+            try output.response.body.writeAll("<html><h1>404 - Not Found.</h1></html>");
+        }
+    };
+}
+
 pub const Request = struct {
     method: http.Method,
     headers: Headers,
@@ -24,57 +197,7 @@ pub const Response = struct {
     body: std.ArrayList(u8).Writer,
 };
 
-pub fn run(comptime T: type, ctx: T, allocator: std.mem.Allocator, max_request_size: usize, handler: anytype) !void {
-    const handler_type_info = @typeInfo(@TypeOf(handler));
-
-    if (handler_type_info != .Fn) @compileError("handler is not a function.");
-
-    const handler_fn = handler_type_info.Fn;
-
-    if (handler_fn.args.len != 4) @compileError("handler requires 4 arguments.");
-
-    if (handler_fn.args[0].arg_type orelse void != T)
-        @compileError("handler first argument is not T.");
-
-    if (handler_fn.args[1].arg_type orelse void != Request)
-        @compileError("handler second argument is not Request.");
-
-    if (handler_fn.args[2].arg_type orelse void != *Response)
-        @compileError("handler third argument is not *Response.");
-
-    if (handler_fn.args[3].arg_type orelse void != *Cache)
-        @compileError("handler fourth argument is not *Cache.");
-
-    const r = handler_fn.return_type.?;
-    const r_info = @typeInfo(r);
-    if (r != void and (r_info != .ErrorUnion or r_info.ErrorUnion.payload != void))
-        @compileError("handle return type is not !void");
-
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-
-    // Initialize Input and Output.
-    var input: Input = undefined;
-    var output: Output = undefined;
-    try Input.fromStdIn(arena.allocator(), &input, max_request_size);
-    try Output.init(arena.allocator(), &output);
-
-    @call(.{}, handler, .{ ctx, input.request, &output.response, &input.cache }) catch |err| {
-        output.response.status = http.Status.internal_server_error;
-
-        output.response.headers.clearAndFree();
-        try output.response.headers.put("content-type", "text/plain");
-
-        output.data.clearAndFree();
-        var writer = output.data.writer();
-        try writer.writeAll("Internal Server Error! ");
-        try writer.print("Error: {}", .{err});
-    };
-
-    // Write output to stdout.
-    try output.toStdOut(&input.cache);
-}
-
+// Internal IO structures.
 const Input = struct {
     request: Request,
     cache: Cache,
@@ -159,7 +282,6 @@ const Output = struct {
     fn init(allocator: mem.Allocator, output: *Output) !void {
         output.base64 = false;
         output.data = std.ArrayList(u8).init(allocator);
-
         output.response.status = http.Status.ok;
         output.response.headers = Headers.init(allocator);
         output.response.body = output.data.writer();

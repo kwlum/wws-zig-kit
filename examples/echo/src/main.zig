@@ -10,5 +10,8 @@ fn handle(_: void, request: kit.Request, response: *kit.Response, _: *kit.Cache)
 }
 
 pub fn main() !void {
-    try kit.run(void, {}, std.heap.c_allocator, 65536, handle);
+    const EchoRoute = kit.Route(void);
+    const route = EchoRoute.init(std.heap.c_allocator, 65535);
+    const methods = .{EchoRoute.post(handle)};
+    try route.run({}, methods);
 }
