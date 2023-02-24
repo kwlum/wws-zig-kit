@@ -162,7 +162,7 @@ pub fn Route(comptime Context: type) type {
             output.response.status = http.Status.internal_server_error;
 
             output.response.headers.clearAndFree();
-            try output.response.headers.put("content-type", "text/plain");
+            try output.response.header("content-type", "text/plain");
 
             output.data.clearAndFree();
             var writer = output.data.writer();
@@ -174,7 +174,7 @@ pub fn Route(comptime Context: type) type {
             output.response.status = http.Status.not_found;
 
             output.response.headers.clearAndFree();
-            try output.response.headers.put("content-type", "text/html");
+            try output.response.header("content-type", "text/html");
 
             output.data.clearAndFree();
             try output.response.body.writeAll("<html><h1>404 - Not Found.</h1></html>");
@@ -195,6 +195,17 @@ pub const Response = struct {
     status: http.Status,
     headers: Headers,
     body: std.ArrayList(u8).Writer,
+    allocator: mem.Allocator,
+
+    pub fn header(self: *Response, name: []const u8, value: []const u8) !void {
+        const n = try self.allocator.dupe(u8, name);
+        const v = try self.allocator.dupe(u8, value);
+        try self.headers.put(n, v);
+    }
+
+    pub fn getHeader(self: *const Response, name: []const u8) ?[]const u8 {
+        return self.headers.get(name);
+    }
 };
 
 // Internal IO structures.
