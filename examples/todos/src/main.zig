@@ -8,91 +8,87 @@ const mem = std.mem;
 const kit = @import("wws-zig-kit");
 
 pub fn main() !void {
+    const TodosRoute = kit.Route(Context);
+    const route = TodosRoute.init(std.heap.c_allocator, 65535);
+    const methods = .{
+        TodosRoute.get(listTodos),
+        TodosRoute.post(createTodo),
+        TodosRoute.put(updateTodo),
+        TodosRoute.delete(deleteTodo),
+    };
+
     var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer arena.deinit();
-
     const allocator = arena.allocator();
     const ctx: Context = .{ .allocator = allocator };
 
-    try kit.run(Context, ctx, allocator, 65536, handle);
+    try route.run(ctx, methods);
 }
 
-fn handle(ctx: Context, request: kit.Request, response: *kit.Response, cache: *kit.Cache) !void {
-    const allocator = ctx.allocator;
+fn listTodos(ctx: Context, _: kit.Request, response: *kit.Response, cache: *kit.Cache) !void {
+    const todos = try getTodosFromKV(ctx.allocator, cache);
+    try json.stringify(todos, .{}, response.body);
+    try response.header("content-type", "application/json");
+    response.status = http.Status.ok;
+}
 
-    switch (request.method) {
-        .GET => {
-            // Get a list of todos.
-            const todos = try getTodosFromKV(allocator, cache);
-            try json.stringify(todos, .{}, response.body);
-            try response.headers.put("content-type", "application/json");
-            response.status = http.Status.ok;
-        },
-        .POST => {
-            // Create new todo.
-            const kv_todos = try getTodosFromKV(allocator, cache);
-            const new_todo = try NewTodoBody.fromJsonString(allocator, request.body);
-            const new_id = try genNextId(allocator, cache);
+fn createTodo(ctx: Context, request: kit.Request, response: *kit.Response, cache: *kit.Cache) !void {
+    const kv_todos = try getTodosFromKV(ctx.allocator, cache);
+    const new_todo = try NewTodoBody.fromJsonString(ctx.allocator, request.body);
+    const new_id = try genNextId(ctx.allocator, cache);
 
-            // Append new todo into Output.KV.
-            var todos = try allocator.alloc(Todo, kv_todos.len + 1);
-            mem.copy(Todo, todos, kv_todos);
-            todos[todos.len - 1] = Todo{
-                .id = new_id,
-                .text = new_todo.text,
-                .completed = false,
-            };
-            try updateTodos(allocator, cache, todos);
+    // Append new todo into Output.KV.
+    var todos = try ctx.allocator.alloc(Todo, kv_todos.len + 1);
+    mem.copy(Todo, todos, kv_todos);
+    todos[todos.len - 1] = Todo{
+        .id = new_id,
+        .text = new_todo.text,
+        .completed = false,
+    };
+    try updateTodos(ctx.allocator, cache, todos);
 
-            // Write new todo to Output.
-            try json.stringify(todos[todos.len - 1], .{}, response.body);
-            try response.headers.put("content-type", "application/json");
-            response.status = http.Status.created;
-        },
-        .PUT => {
-            // Update a todo.
-            const update_todo = try UpdateTodoBody.fromJsonString(allocator, request.body);
-            var kv_todos = try getTodosFromKV(allocator, cache);
-            for (kv_todos) |*a| {
-                if (a.id == update_todo.id) {
-                    a.text = update_todo.text;
-                    a.completed = update_todo.completed;
-                    break;
-                }
-            }
+    // Write new todo to Output.
+    try json.stringify(todos[todos.len - 1], .{}, response.body);
+    try response.header("content-type", "application/json");
+    response.status = http.Status.created;
+}
 
-            try updateTodos(allocator, cache, kv_todos);
-
-            try response.headers.put("content-type", "application/json");
-            try response.body.writeAll("{}");
-            response.status = http.Status.ok;
-        },
-        .DELETE => {
-            // Delete a todo.
-            const delete_todo = try DeleteTodoBody.fromJsonString(allocator, request.body);
-            const kv_todos = try getTodosFromKV(allocator, cache);
-
-            var todos = try allocator.alloc(Todo, kv_todos.len);
-            var i: u32 = 0;
-            for (kv_todos) |a| {
-                if (a.id != delete_todo.id) {
-                    todos[i] = a;
-                    i += 1;
-                }
-            }
-
-            try updateTodos(allocator, cache, todos[0..i]);
-
-            try response.headers.put("content-type", "application/json");
-            try response.body.writeAll("{}");
-            response.status = http.Status.ok;
-        },
-        else => {
-            try response.body.writeAll("Bad Request!");
-            try response.headers.put("content-type", "text/plain");
-            response.status = http.Status.bad_request;
-        },
+fn updateTodo(ctx: Context, request: kit.Request, response: *kit.Response, cache: *kit.Cache) !void {
+    const update_todo = try UpdateTodoBody.fromJsonString(ctx.allocator, request.body);
+    var kv_todos = try getTodosFromKV(ctx.allocator, cache);
+    for (kv_todos) |*a| {
+        if (a.id == update_todo.id) {
+            a.text = update_todo.text;
+            a.completed = update_todo.completed;
+            break;
+        }
     }
+
+    try updateTodos(ctx.allocator, cache, kv_todos);
+
+    try response.header("content-type", "application/json");
+    try response.body.writeAll("{}");
+    response.status = http.Status.ok;
+}
+
+fn deleteTodo(ctx: Context, request: kit.Request, response: *kit.Response, cache: *kit.Cache) !void {
+    const delete_todo = try DeleteTodoBody.fromJsonString(ctx.allocator, request.body);
+    const kv_todos = try getTodosFromKV(ctx.allocator, cache);
+
+    var todos = try ctx.allocator.alloc(Todo, kv_todos.len);
+    var i: u32 = 0;
+    for (kv_todos) |a| {
+        if (a.id != delete_todo.id) {
+            todos[i] = a;
+            i += 1;
+        }
+    }
+
+    try updateTodos(ctx.allocator, cache, todos[0..i]);
+
+    try response.header("content-type", "application/json");
+    try response.body.writeAll("{}");
+    response.status = http.Status.ok;
 }
 
 const Context = struct {
