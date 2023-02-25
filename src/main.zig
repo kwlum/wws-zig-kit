@@ -5,7 +5,6 @@ const http = std.http;
 const json = std.json;
 const mem = std.mem;
 
-pub const Cache = std.StringHashMap([]const u8);
 pub const Headers = std.StringHashMap([]const u8);
 pub const Params = std.StringHashMap([]const u8);
 
@@ -86,76 +85,48 @@ pub fn Route(comptime Context: type) type {
             };
         }
 
-        pub fn get(comptime handle_fn: HandleFn) Handler {
+        pub fn onMethod(comptime method: http.Method, comptime handle_fn: HandleFn) Handler {
             return .{
                 .handle_fn = handle_fn,
-                .method = http.Method.GET,
+                .method = method,
                 .handler_type = .specific,
             };
+        }
+
+        pub fn get(comptime handle_fn: HandleFn) Handler {
+            return onMethod(http.Method.GET, handle_fn);
         }
 
         pub fn post(comptime handle_fn: HandleFn) Handler {
-            return .{
-                .handle_fn = handle_fn,
-                .method = http.Method.POST,
-                .handler_type = .specific,
-            };
+            return onMethod(http.Method.POST, handle_fn);
         }
 
         pub fn put(comptime handle_fn: HandleFn) Handler {
-            return .{
-                .handle_fn = handle_fn,
-                .method = http.Method.PUT,
-                .handler_type = .specific,
-            };
+            return onMethod(http.Method.PUT, handle_fn);
         }
 
         pub fn delete(comptime handle_fn: HandleFn) Handler {
-            return .{
-                .handle_fn = handle_fn,
-                .method = http.Method.DELETE,
-                .handler_type = .specific,
-            };
+            return onMethod(http.Method.DELETE, handle_fn);
         }
 
         pub fn head(comptime handle_fn: HandleFn) Handler {
-            return .{
-                .handle_fn = handle_fn,
-                .method = http.Method.HEAD,
-                .handler_type = .specific,
-            };
+            return onMethod(http.Method.HEAD, handle_fn);
         }
 
         pub fn patch(comptime handle_fn: HandleFn) Handler {
-            return .{
-                .handle_fn = handle_fn,
-                .method = http.Method.PATCH,
-                .handler_type = .specific,
-            };
+            return onMethod(http.Method.PATCH, handle_fn);
         }
 
         pub fn connect(comptime handle_fn: HandleFn) Handler {
-            return .{
-                .handle_fn = handle_fn,
-                .method = http.Method.CONNECT,
-                .handler_type = .specific,
-            };
+            return onMethod(http.Method.CONNECT, handle_fn);
         }
 
         pub fn options(comptime handle_fn: HandleFn) Handler {
-            return .{
-                .handle_fn = handle_fn,
-                .method = http.Method.OPTIONS,
-                .handler_type = .specific,
-            };
+            return onMethod(http.Method.OPTIONS, handle_fn);
         }
 
         pub fn trace(comptime handle_fn: HandleFn) Handler {
-            return .{
-                .handle_fn = handle_fn,
-                .method = http.Method.TRACE,
-                .handler_type = .specific,
-            };
+            return onMethod(http.Method.TRACE, handle_fn);
         }
 
         fn renderErrorResponse(output: *Output, err: anyerror) !void {
@@ -197,6 +168,8 @@ pub const Response = struct {
     body: std.ArrayList(u8).Writer,
     allocator: mem.Allocator,
 
+    // TODO(KW): implement init.
+
     pub fn header(self: *Response, name: []const u8, value: []const u8) !void {
         const n = try self.allocator.dupe(u8, name);
         const v = try self.allocator.dupe(u8, value);
@@ -205,6 +178,29 @@ pub const Response = struct {
 
     pub fn getHeader(self: *const Response, name: []const u8) ?[]const u8 {
         return self.headers.get(name);
+    }
+};
+
+pub const Cache = struct {
+    store: std.StringHashMap([]const u8),
+    allocator: mem.Allocator,
+
+    fn init(allocator: mem.Allocator) Cache {
+        return .{
+            .allocator = allocator,
+            .store = std.StringHashMap([]const u8).init(allocator),
+        };
+    }
+
+    pub fn get(self: *const Cache, name: []const u8) ?[]const u8 {
+        return self.store.get(name);
+    }
+
+    /// name and value are copied.
+    pub fn put(self: *Cache, name: []const u8, value: []const u8) !void {
+        const n = try self.allocator.dupe(u8, name);
+        const v = try self.allocator.dupe(u8, value);
+        try self.store.put(n, v);
     }
 };
 
@@ -225,7 +221,7 @@ const Input = struct {
         const tree_kv = json_tree.root.Object.get("kv").?.Object;
         const tree_kv_keys = tree_kv.keys();
         for (tree_kv_keys) |kv_key| {
-            try input.cache.put(kv_key, tree_kv.get(kv_key).?.String);
+            try input.cache.store.put(kv_key, tree_kv.get(kv_key).?.String);
         }
 
         // Construct Request.
@@ -327,8 +323,8 @@ const Output = struct {
 
         // Write KV.
         i = 0;
-        const cache_len = cache.count();
-        var cache_entry_itr = cache.iterator();
+        const cache_len = cache.store.count();
+        var cache_entry_itr = cache.store.iterator();
         _ = try stdout.write("\"kv\":{");
         while (cache_entry_itr.next()) |entry| {
             try json.encodeJsonString(entry.key_ptr.*, .{}, stdout);
