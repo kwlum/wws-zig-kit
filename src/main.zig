@@ -296,6 +296,7 @@ const Output = struct {
         output.response.status = http.Status.ok;
         output.response.headers = Headers.init(allocator);
         output.response.body = output.data.writer();
+        output.response.allocator = allocator;
     }
 
     fn toStdOut(self: *Output, cache: *const Cache) !void {
