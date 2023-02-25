@@ -5,7 +5,6 @@ const http = std.http;
 const json = std.json;
 const mem = std.mem;
 
-pub const Headers = std.StringHashMap([]const u8);
 pub const Params = std.StringHashMap([]const u8);
 
 pub fn Route(comptime Context: type) type {
@@ -132,8 +131,8 @@ pub fn Route(comptime Context: type) type {
         fn renderErrorResponse(output: *Output, err: anyerror) !void {
             output.response.status = http.Status.internal_server_error;
 
-            output.response.headers.clearAndFree();
-            try output.response.header("content-type", "text/plain");
+            output.response.headers.store.clearAndFree();
+            try output.response.headers.put("content-type", "text/plain");
 
             output.data.clearAndFree();
             var writer = output.data.writer();
@@ -144,8 +143,8 @@ pub fn Route(comptime Context: type) type {
         fn renderNotFoundResponse(output: *Output) !void {
             output.response.status = http.Status.not_found;
 
-            output.response.headers.clearAndFree();
-            try output.response.header("content-type", "text/html");
+            output.response.headers.store.clearAndFree();
+            try output.response.headers.store.put("content-type", "text/html");
 
             output.data.clearAndFree();
             try output.response.body.writeAll("<html><h1>404 - Not Found.</h1></html>");
@@ -167,18 +166,6 @@ pub const Response = struct {
     headers: Headers,
     body: std.ArrayList(u8).Writer,
     allocator: mem.Allocator,
-
-    // TODO(KW): implement init.
-
-    pub fn header(self: *Response, name: []const u8, value: []const u8) !void {
-        const n = try self.allocator.dupe(u8, name);
-        const v = try self.allocator.dupe(u8, value);
-        try self.headers.put(n, v);
-    }
-
-    pub fn getHeader(self: *const Response, name: []const u8) ?[]const u8 {
-        return self.headers.get(name);
-    }
 };
 
 pub const Cache = struct {
@@ -198,6 +185,29 @@ pub const Cache = struct {
 
     /// name and value are copied.
     pub fn put(self: *Cache, name: []const u8, value: []const u8) !void {
+        const n = try self.allocator.dupe(u8, name);
+        const v = try self.allocator.dupe(u8, value);
+        try self.store.put(n, v);
+    }
+};
+
+pub const Headers = struct {
+    store: std.StringHashMap([]const u8),
+    allocator: mem.Allocator,
+
+    fn init(allocator: mem.Allocator) Headers {
+        return .{
+            .allocator = allocator,
+            .store = std.StringHashMap([]const u8).init(allocator),
+        };
+    }
+
+    pub fn get(self: *const Headers, name: []const u8) ?[]const u8 {
+        return self.store.get(name);
+    }
+
+    /// name and value are copied.
+    pub fn put(self: *Headers, name: []const u8, value: []const u8) !void {
         const n = try self.allocator.dupe(u8, name);
         const v = try self.allocator.dupe(u8, value);
         try self.store.put(n, v);
@@ -249,7 +259,7 @@ const Input = struct {
         const tree_headers = json_tree.root.Object.get("headers").?.Object;
         const tree_headers_keys = tree_headers.keys();
         for (tree_headers_keys) |header_key| {
-            try input.request.headers.put(header_key, tree_headers.get(header_key).?.String);
+            try input.request.headers.store.put(header_key, tree_headers.get(header_key).?.String);
         }
 
         // Determine Request Method.
@@ -304,9 +314,9 @@ const Output = struct {
         try stdout.print("{{\"status\":{d},\"base64\":{},", .{ @enumToInt(self.response.status), self.base64 });
 
         // Write headers.
-        const headers_len = self.response.headers.count();
+        const headers_len = self.response.headers.store.count();
         var i: usize = 0;
-        var headers_entry_itr = self.response.headers.iterator();
+        var headers_entry_itr = self.response.headers.store.iterator();
         _ = try stdout.write("\"headers\":{");
         while (headers_entry_itr.next()) |entry| {
             try json.encodeJsonString(entry.key_ptr.*, .{}, stdout);

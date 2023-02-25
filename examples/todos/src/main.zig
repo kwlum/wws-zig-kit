@@ -28,7 +28,7 @@ pub fn main() !void {
 fn listTodos(ctx: Context, _: kit.Request, response: *kit.Response, cache: *kit.Cache) !void {
     const todos = try getTodosFromKV(ctx.allocator, cache);
     try json.stringify(todos, .{}, response.body);
-    try response.header("content-type", "application/json");
+    try response.headers.put("content-type", "application/json");
     response.status = http.Status.ok;
 }
 
@@ -49,7 +49,7 @@ fn createTodo(ctx: Context, request: kit.Request, response: *kit.Response, cache
 
     // Write new todo to Output.
     try json.stringify(todos[todos.len - 1], .{}, response.body);
-    try response.header("content-type", "application/json");
+    try response.headers.put("content-type", "application/json");
     response.status = http.Status.created;
 }
 
@@ -66,7 +66,7 @@ fn updateTodo(ctx: Context, request: kit.Request, response: *kit.Response, cache
 
     try updateTodos(ctx.allocator, cache, kv_todos);
 
-    try response.header("content-type", "application/json");
+    try response.headers.put("content-type", "application/json");
     try response.body.writeAll("{}");
     response.status = http.Status.ok;
 }
@@ -86,7 +86,7 @@ fn deleteTodo(ctx: Context, request: kit.Request, response: *kit.Response, cache
 
     try updateTodos(ctx.allocator, cache, todos[0..i]);
 
-    try response.header("content-type", "application/json");
+    try response.headers.put("content-type", "application/json");
     try response.body.writeAll("{}");
     response.status = http.Status.ok;
 }
