@@ -11,15 +11,21 @@ pub const Error = error{
 
 pub const Params = std.StringHashMap([]const u8);
 
-pub fn Route(comptime Context: type, comptime Middleware: type) type {
+const NoMiddleware = struct {
+    pub fn run(_: *const NoMiddleware, _: anytype, _: *Request, _: *Response, _: *Cache, _: anytype) !void {}
+};
+
+pub fn DefaultServer(comptime Context: type) type {
+    return Server(Context, NoMiddleware);
+}
+
+pub fn Server(comptime Context: type, comptime Middleware: type) type {
     return struct {
         allocator: mem.Allocator,
         max_request_size: usize,
-        context: *Context,
-        middlewares: []const Middleware,
+        middlewares: ?[]*const Middleware,
 
         const Self = @This();
-        const MiddlewareFn = fn (*Context, *Request, *Response, *Cache, *Next) anyerror!void;
         const HandleFn = fn (*Context, Request, *Response, *Cache) anyerror!void;
 
         pub const Handler = struct {
@@ -102,25 +108,26 @@ pub fn Route(comptime Context: type, comptime Middleware: type) type {
             return .{
                 .allocator = allocator,
                 .max_request_size = max_request_size,
-                .context = undefined,
-                .middlewares = undefined,
+                .middlewares = null,
             };
         }
 
         pub fn run(
             self: *const Self,
+            context: *Context,
             handlers: []const Handler,
         ) !void {
             var arena = std.heap.ArenaAllocator.init(self.allocator);
             defer arena.deinit();
 
-            var nexts = try arena.allocator().alloc(Next, self.middlewares.len + 1);
+            const middlewares_len = if (self.middlewares) |a| a.len else 0;
+            var nexts = try arena.allocator().alloc(Next, middlewares_len + 1);
             for (nexts[0 .. nexts.len - 1]) |*a, i| {
                 a.* = .{
                     .middleware = .{
                         .nexts = nexts,
                         .next_index = i + 1,
-                        .middleware = &self.middlewares[i],
+                        .middleware = self.middlewares.?[i],
                     },
                 };
             }
@@ -136,7 +143,7 @@ pub fn Route(comptime Context: type, comptime Middleware: type) type {
             try Input.fromStdIn(arena.allocator(), self.max_request_size, &input);
             try Output.init(arena.allocator(), &output);
 
-            try nexts[0].run(self.context, &input.request, &output.response, &input.cache);
+            try nexts[0].run(context, &input.request, &output.response, &input.cache);
 
             // Write output to stdout.
             try output.toStdOut(&input.cache);
