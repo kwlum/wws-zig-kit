@@ -5,80 +5,149 @@ const http = std.http;
 const json = std.json;
 const mem = std.mem;
 
-pub const Cache = std.StringHashMap([]const u8);
-pub const Headers = std.StringHashMap([]const u8);
+pub const Error = error{
+    HandlerNotFound,
+};
+
 pub const Params = std.StringHashMap([]const u8);
 
-pub fn Route(comptime Context: type) type {
+const NoMiddleware = struct {
+    pub fn run(_: *const NoMiddleware, _: anytype, _: *Request, _: *Response, _: *Cache, _: anytype) !void {}
+};
+
+pub fn DefaultServer(comptime Context: type) type {
+    return Server(Context, NoMiddleware);
+}
+
+pub fn Server(comptime Context: type, comptime Middleware: type) type {
     return struct {
         allocator: mem.Allocator,
         max_request_size: usize,
+        middlewares: ?[]*Middleware,
 
         const Self = @This();
-        const HandleFn = fn (Context, Request, *Response, *Cache) anyerror!void;
+        const HandleFn = fn (*Context, Request, *Response, *Cache) anyerror!void;
 
-        const HandlerType = enum {
-            all,
-            specific,
+        pub const Handler = struct {
+            handle_fn: *const HandleFn,
+            method: http.Method,
+            handler_type: enum { all, specific },
         };
 
-        const Handler = struct {
-            handle_fn: HandleFn,
-            method: http.Method,
-            handler_type: HandlerType,
+        pub const Next = union(enum) {
+            middleware: MiddlewareNext,
+            request_handler: RequestHandlerNext,
+
+            pub fn run(
+                self: *const Next,
+                ctx: *Context,
+                request: *Request,
+                response: *Response,
+                cache: *Cache,
+            ) !void {
+                switch (self.*) {
+                    inline else => |s| try s.run(ctx, request, response, cache),
+                }
+            }
+        };
+
+        const MiddlewareNext = struct {
+            middleware: *Middleware,
+            next: *const Next,
+
+            pub fn run(
+                self: *const MiddlewareNext,
+                ctx: *Context,
+                request: *Request,
+                response: *Response,
+                cache: *Cache,
+            ) !void {
+                try self.middleware.run(ctx, request, response, cache, self.next);
+            }
+        };
+
+        const RequestHandlerNext = struct {
+            handlers: []const Handler,
+
+            pub fn run(
+                self: *const RequestHandlerNext,
+                ctx: *Context,
+                request: *Request,
+                response: *Response,
+                cache: *Cache,
+            ) !void {
+                // Match the request method and invoke specific handler.
+                // Lookup the type all handler.
+                var not_found = true;
+                var type_all_handler: ?Handler = null;
+                for (self.handlers) |handler| {
+                    switch (handler.handler_type) {
+                        .specific => {
+                            if (handler.method == request.method) {
+                                not_found = false;
+                                try @call(.{}, handler.handle_fn, .{ ctx, request.*, response, cache });
+                            }
+                        },
+                        .all => type_all_handler = handler,
+                    }
+                }
+
+                // Invoke the type all handler or throw error.
+                if (not_found) {
+                    if (type_all_handler) |handler| {
+                        try @call(.{}, handler.handle_fn, .{ ctx, request.*, response, cache });
+                    } else {
+                        return Error.HandlerNotFound;
+                    }
+                }
+            }
         };
 
         pub fn init(allocator: mem.Allocator, max_request_size: usize) Self {
             return .{
                 .allocator = allocator,
                 .max_request_size = max_request_size,
+                .middlewares = null,
             };
         }
 
-        pub fn run(self: *const Self, ctx: Context, handlers: anytype) !void {
+        pub fn run(
+            self: *const Self,
+            context: *Context,
+            handlers: []const Handler,
+        ) !void {
             var arena = std.heap.ArenaAllocator.init(self.allocator);
             defer arena.deinit();
+
+            const middlewares_len = if (self.middlewares) |a| a.len else 0;
+            var nexts = try arena.allocator().alloc(Next, middlewares_len + 1);
+            for (nexts[0 .. nexts.len - 1]) |*a, i| {
+                a.* = .{
+                    .middleware = .{
+                        .middleware = self.middlewares.?[i],
+                        .next = &nexts[i + 1],
+                    },
+                };
+            }
+            nexts[nexts.len - 1] = .{
+                .request_handler = .{
+                    .handlers = handlers,
+                },
+            };
 
             // Initialize Input and Output.
             var input: Input = undefined;
             var output: Output = undefined;
-            try Input.fromStdIn(arena.allocator(), &input, self.max_request_size);
+            try Input.fromStdIn(arena.allocator(), self.max_request_size, &input);
             try Output.init(arena.allocator(), &output);
 
-            // Match the request method and invoke specific handler.
-            // Lookup the type all handler.
-            var not_found = true;
-            comptime var type_all_handler: ?Handler = null;
-            inline for (handlers) |handler| {
-                switch (handler.handler_type) {
-                    .specific => {
-                        if (handler.method == input.request.method) {
-                            not_found = false;
-                            @call(.{}, handler.handle_fn, .{ ctx, input.request, &output.response, &input.cache }) catch |err| {
-                                try renderErrorResponse(&output, err);
-                            };
-                        }
-                    },
-                    .all => type_all_handler = handler,
-                }
-            }
-
-            // Invoke the type all handler or render default not found response.
-            if (not_found) {
-                if (type_all_handler) |handler| {
-                    @call(.{}, handler.handle_fn, .{ ctx, input.request, &output.response, &input.cache }) catch |err| {
-                        try renderErrorResponse(&output, err);
-                    };
-                } else {
-                    try renderNotFoundResponse(&output);
-                }
-            }
+            try nexts[0].run(context, &input.request, &output.response, &input.cache);
 
             // Write output to stdout.
             try output.toStdOut(&input.cache);
         }
 
-        pub fn all(comptime handle_fn: HandleFn) Handler {
+        pub fn all(handle_fn: *const HandleFn) Handler {
             return .{
                 .handle_fn = handle_fn,
                 .method = http.Method.GET,
@@ -86,98 +155,48 @@ pub fn Route(comptime Context: type) type {
             };
         }
 
-        pub fn get(comptime handle_fn: HandleFn) Handler {
+        pub fn onMethod(method: http.Method, handle_fn: *const HandleFn) Handler {
             return .{
                 .handle_fn = handle_fn,
-                .method = http.Method.GET,
+                .method = method,
                 .handler_type = .specific,
             };
         }
 
-        pub fn post(comptime handle_fn: HandleFn) Handler {
-            return .{
-                .handle_fn = handle_fn,
-                .method = http.Method.POST,
-                .handler_type = .specific,
-            };
+        pub fn get(handle_fn: *const HandleFn) Handler {
+            return onMethod(http.Method.GET, handle_fn);
         }
 
-        pub fn put(comptime handle_fn: HandleFn) Handler {
-            return .{
-                .handle_fn = handle_fn,
-                .method = http.Method.PUT,
-                .handler_type = .specific,
-            };
+        pub fn post(handle_fn: *const HandleFn) Handler {
+            return onMethod(http.Method.POST, handle_fn);
         }
 
-        pub fn delete(comptime handle_fn: HandleFn) Handler {
-            return .{
-                .handle_fn = handle_fn,
-                .method = http.Method.DELETE,
-                .handler_type = .specific,
-            };
+        pub fn put(handle_fn: *const HandleFn) Handler {
+            return onMethod(http.Method.PUT, handle_fn);
         }
 
-        pub fn head(comptime handle_fn: HandleFn) Handler {
-            return .{
-                .handle_fn = handle_fn,
-                .method = http.Method.HEAD,
-                .handler_type = .specific,
-            };
+        pub fn delete(handle_fn: *const HandleFn) Handler {
+            return onMethod(http.Method.DELETE, handle_fn);
         }
 
-        pub fn patch(comptime handle_fn: HandleFn) Handler {
-            return .{
-                .handle_fn = handle_fn,
-                .method = http.Method.PATCH,
-                .handler_type = .specific,
-            };
+        pub fn head(handle_fn: *const HandleFn) Handler {
+            return onMethod(http.Method.HEAD, handle_fn);
         }
 
-        pub fn connect(comptime handle_fn: HandleFn) Handler {
-            return .{
-                .handle_fn = handle_fn,
-                .method = http.Method.CONNECT,
-                .handler_type = .specific,
-            };
+        pub fn patch(handle_fn: *const HandleFn) Handler {
+            return onMethod(http.Method.PATCH, handle_fn);
         }
 
-        pub fn options(comptime handle_fn: HandleFn) Handler {
-            return .{
-                .handle_fn = handle_fn,
-                .method = http.Method.OPTIONS,
-                .handler_type = .specific,
-            };
+        pub fn connect(handle_fn: *const HandleFn) Handler {
+            return onMethod(http.Method.CONNECT, handle_fn);
         }
 
-        pub fn trace(comptime handle_fn: HandleFn) Handler {
-            return .{
-                .handle_fn = handle_fn,
-                .method = http.Method.TRACE,
-                .handler_type = .specific,
-            };
+        pub fn options(handle_fn: *const HandleFn) Handler {
+            return onMethod(http.Method.OPTIONS, handle_fn);
         }
 
-        fn renderErrorResponse(output: *Output, err: anyerror) !void {
-            output.response.status = http.Status.internal_server_error;
-
-            output.response.headers.clearAndFree();
-            try output.response.header("content-type", "text/plain");
-
-            output.data.clearAndFree();
-            var writer = output.data.writer();
-            try writer.writeAll("500 - Internal Server Error. ");
-            try writer.print("Error: {}", .{err});
-        }
-
-        fn renderNotFoundResponse(output: *Output) !void {
-            output.response.status = http.Status.not_found;
-
-            output.response.headers.clearAndFree();
-            try output.response.header("content-type", "text/html");
-
-            output.data.clearAndFree();
-            try output.response.body.writeAll("<html><h1>404 - Not Found.</h1></html>");
+        pub fn trace(handle_fn: *const HandleFn) Handler {
+            return onMethod(http.Method.TRACE, handle_fn);
         }
     };
 }
@@ -196,15 +215,51 @@ pub const Response = struct {
     headers: Headers,
     body: std.ArrayList(u8).Writer,
     allocator: mem.Allocator,
+};
 
-    pub fn header(self: *Response, name: []const u8, value: []const u8) !void {
-        const n = try self.allocator.dupe(u8, name);
-        const v = try self.allocator.dupe(u8, value);
-        try self.headers.put(n, v);
+pub const Cache = struct {
+    store: std.StringHashMap([]const u8),
+    allocator: mem.Allocator,
+
+    fn init(allocator: mem.Allocator) Cache {
+        return .{
+            .allocator = allocator,
+            .store = std.StringHashMap([]const u8).init(allocator),
+        };
     }
 
-    pub fn getHeader(self: *const Response, name: []const u8) ?[]const u8 {
-        return self.headers.get(name);
+    pub fn get(self: *const Cache, name: []const u8) ?[]const u8 {
+        return self.store.get(name);
+    }
+
+    /// name and value are copied.
+    pub fn put(self: *Cache, name: []const u8, value: []const u8) !void {
+        const n = try self.allocator.dupe(u8, name);
+        const v = try self.allocator.dupe(u8, value);
+        try self.store.put(n, v);
+    }
+};
+
+pub const Headers = struct {
+    store: std.StringHashMap([]const u8),
+    allocator: mem.Allocator,
+
+    fn init(allocator: mem.Allocator) Headers {
+        return .{
+            .allocator = allocator,
+            .store = std.StringHashMap([]const u8).init(allocator),
+        };
+    }
+
+    pub fn get(self: *const Headers, name: []const u8) ?[]const u8 {
+        return self.store.get(name);
+    }
+
+    /// name and value are copied.
+    pub fn put(self: *Headers, name: []const u8, value: []const u8) !void {
+        const n = try self.allocator.dupe(u8, name);
+        const v = try self.allocator.dupe(u8, value);
+        try self.store.put(n, v);
     }
 };
 
@@ -213,7 +268,7 @@ const Input = struct {
     request: Request,
     cache: Cache,
 
-    fn fromStdIn(allocator: mem.Allocator, input: *Input, max_size: usize) !void {
+    fn fromStdIn(allocator: mem.Allocator, max_size: usize, input: *Input) !void {
         // Parse Input json string from stdin.
         const stdin = std.io.getStdIn().reader();
         const input_string = try stdin.readAllAlloc(allocator, max_size);
@@ -225,7 +280,7 @@ const Input = struct {
         const tree_kv = json_tree.root.Object.get("kv").?.Object;
         const tree_kv_keys = tree_kv.keys();
         for (tree_kv_keys) |kv_key| {
-            try input.cache.put(kv_key, tree_kv.get(kv_key).?.String);
+            try input.cache.store.put(kv_key, tree_kv.get(kv_key).?.String);
         }
 
         // Construct Request.
@@ -253,7 +308,7 @@ const Input = struct {
         const tree_headers = json_tree.root.Object.get("headers").?.Object;
         const tree_headers_keys = tree_headers.keys();
         for (tree_headers_keys) |header_key| {
-            try input.request.headers.put(header_key, tree_headers.get(header_key).?.String);
+            try input.request.headers.store.put(header_key, tree_headers.get(header_key).?.String);
         }
 
         // Determine Request Method.
@@ -308,9 +363,9 @@ const Output = struct {
         try stdout.print("{{\"status\":{d},\"base64\":{},", .{ @enumToInt(self.response.status), self.base64 });
 
         // Write headers.
-        const headers_len = self.response.headers.count();
+        const headers_len = self.response.headers.store.count();
         var i: usize = 0;
-        var headers_entry_itr = self.response.headers.iterator();
+        var headers_entry_itr = self.response.headers.store.iterator();
         _ = try stdout.write("\"headers\":{");
         while (headers_entry_itr.next()) |entry| {
             try json.encodeJsonString(entry.key_ptr.*, .{}, stdout);
@@ -327,8 +382,8 @@ const Output = struct {
 
         // Write KV.
         i = 0;
-        const cache_len = cache.count();
-        var cache_entry_itr = cache.iterator();
+        const cache_len = cache.store.count();
+        var cache_entry_itr = cache.store.iterator();
         _ = try stdout.write("\"kv\":{");
         while (cache_entry_itr.next()) |entry| {
             try json.encodeJsonString(entry.key_ptr.*, .{}, stdout);

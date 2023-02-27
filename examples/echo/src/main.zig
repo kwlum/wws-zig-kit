@@ -3,15 +3,17 @@ const http = std.http;
 
 const kit = @import("wws-zig-kit");
 
-fn handle(_: void, request: kit.Request, response: *kit.Response, _: *kit.Cache) !void {
-    try response.header("content-type", "text/plain");
+const App = kit.DefaultServer(void);
+
+fn handleEcho(_: *void, request: kit.Request, response: *kit.Response, _: *kit.Cache) !void {
+    try response.headers.put("content-type", "text/plain");
     try response.body.writeAll(request.body);
     response.status = http.Status.ok;
 }
 
 pub fn main() !void {
-    const EchoRoute = kit.Route(void);
-    const route = EchoRoute.init(std.heap.c_allocator, 65535);
-    const methods = .{EchoRoute.post(handle)};
-    try route.run({}, methods);
+    var app = App.init(std.heap.c_allocator, 65535);
+    const handlers = [_]App.Handler{App.post(handleEcho)};
+    var no_context = {};
+    try app.run(&no_context, &handlers);
 }
