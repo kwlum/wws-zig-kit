@@ -23,7 +23,7 @@ pub fn Server(comptime Context: type, comptime Middleware: type) type {
     return struct {
         allocator: mem.Allocator,
         max_request_size: usize,
-        middlewares: ?[]*const Middleware,
+        middlewares: ?[]*Middleware,
 
         const Self = @This();
         const HandleFn = fn (*Context, Request, *Response, *Cache) anyerror!void;
@@ -52,7 +52,7 @@ pub fn Server(comptime Context: type, comptime Middleware: type) type {
         };
 
         const MiddlewareNext = struct {
-            middleware: *const Middleware,
+            middleware: *Middleware,
             next: *const Next,
 
             pub fn run(
