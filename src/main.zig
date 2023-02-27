@@ -53,8 +53,7 @@ pub fn Server(comptime Context: type, comptime Middleware: type) type {
 
         const MiddlewareNext = struct {
             middleware: *const Middleware,
-            nexts: []const Next,
-            next_index: usize,
+            next: *const Next,
 
             pub fn run(
                 self: *const MiddlewareNext,
@@ -63,7 +62,7 @@ pub fn Server(comptime Context: type, comptime Middleware: type) type {
                 response: *Response,
                 cache: *Cache,
             ) !void {
-                try self.middleware.run(ctx, request, response, cache, &self.nexts[self.next_index]);
+                try self.middleware.run(ctx, request, response, cache, self.next);
             }
         };
 
@@ -93,7 +92,7 @@ pub fn Server(comptime Context: type, comptime Middleware: type) type {
                     }
                 }
 
-                // Invoke the type all handler or render default not found response.
+                // Invoke the type all handler or throw error.
                 if (not_found) {
                     if (type_all_handler) |handler| {
                         try @call(.{}, handler.handle_fn, .{ ctx, request.*, response, cache });
@@ -125,9 +124,8 @@ pub fn Server(comptime Context: type, comptime Middleware: type) type {
             for (nexts[0 .. nexts.len - 1]) |*a, i| {
                 a.* = .{
                     .middleware = .{
-                        .nexts = nexts,
-                        .next_index = i + 1,
                         .middleware = self.middlewares.?[i],
+                        .next = &nexts[i + 1],
                     },
                 };
             }
