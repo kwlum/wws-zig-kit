@@ -6,37 +6,181 @@ const json = std.json;
 const mem = std.mem;
 
 pub const Error = error{
-    HandlerNotFound,
+    RouteNotFound,
 };
 
 pub const Params = std.StringHashMap([]const u8);
 
-const NoMiddleware = struct {
-    pub fn run(_: *const NoMiddleware, _: anytype, _: *Request, _: *Response, _: *Cache, _: anytype) !void {}
-};
-
-pub fn DefaultServer(comptime Context: type) type {
-    return Server(Context, NoMiddleware);
-}
-
-pub fn Server(comptime Context: type, comptime Middleware: type) type {
+pub fn App(comptime Context: type) type {
     return struct {
-        allocator: mem.Allocator,
-        max_request_size: usize,
-        middlewares: ?[]*Middleware,
+        pub const Middleware = struct {
+            ptr: *anyopaque,
+            run_fn: *const fn (*anyopaque, *Context, *Request, *Response, *Cache, *const Next) anyerror!void,
 
-        const Self = @This();
-        const HandleFn = fn (*Context, Request, *Response, *Cache) anyerror!void;
+            pub fn init(middleware: anytype) Middleware {
+                const M = @TypeOf(middleware);
+                const m_info = @typeInfo(M);
 
-        pub const Handler = struct {
+                if (m_info != .Pointer) @compileError("middleware is not pointer.");
+                if (m_info.Pointer.size != .One) @compileError("middleware is not single item pointer.");
+
+                const alignment = m_info.Pointer.alignment;
+
+                const S = struct {
+                    pub fn run(
+                        ptr: *anyopaque,
+                        context: *Context,
+                        request: *Request,
+                        response: *Response,
+                        cache: *Cache,
+                        next: *const Next,
+                    ) !void {
+                        const self = if (alignment >= 1)
+                            @ptrCast(M, @alignCast(alignment, ptr))
+                        else
+                            @ptrCast(M, ptr);
+
+                        try @call(.{}, m_info.Pointer.child.run, .{
+                            self,
+                            context,
+                            request,
+                            response,
+                            cache,
+                            next,
+                        });
+                    }
+                };
+
+                return .{
+                    .ptr = middleware,
+                    .run_fn = S.run,
+                };
+            }
+
+            pub fn run(
+                self: Middleware,
+                context: *Context,
+                request: *Request,
+                response: *Response,
+                cache: *Cache,
+                next: *const Next,
+            ) !void {
+                try self.run_fn(self.ptr, context, request, response, cache, next);
+            }
+        };
+
+        pub const Route = struct {
             handle_fn: *const HandleFn,
             method: http.Method,
-            handler_type: enum { all, specific },
+            route_type: enum { all, specific },
+
+            const HandleFn = fn (*Context, Request, *Response, *Cache) anyerror!void;
+
+            pub fn all(handle_fn: *const HandleFn) Route {
+                return .{
+                    .handle_fn = handle_fn,
+                    .method = http.Method.GET,
+                    .route_type = .all,
+                };
+            }
+
+            pub fn onMethod(method: http.Method, handle_fn: *const HandleFn) Route {
+                return .{
+                    .handle_fn = handle_fn,
+                    .method = method,
+                    .route_type = .specific,
+                };
+            }
+
+            pub fn get(handle_fn: *const HandleFn) Route {
+                return onMethod(http.Method.GET, handle_fn);
+            }
+
+            pub fn post(handle_fn: *const HandleFn) Route {
+                return onMethod(http.Method.POST, handle_fn);
+            }
+
+            pub fn put(handle_fn: *const HandleFn) Route {
+                return onMethod(http.Method.PUT, handle_fn);
+            }
+
+            pub fn delete(handle_fn: *const HandleFn) Route {
+                return onMethod(http.Method.DELETE, handle_fn);
+            }
+
+            pub fn head(handle_fn: *const HandleFn) Route {
+                return onMethod(http.Method.HEAD, handle_fn);
+            }
+
+            pub fn patch(handle_fn: *const HandleFn) Route {
+                return onMethod(http.Method.PATCH, handle_fn);
+            }
+
+            pub fn connect(handle_fn: *const HandleFn) Route {
+                return onMethod(http.Method.CONNECT, handle_fn);
+            }
+
+            pub fn options(handle_fn: *const HandleFn) Route {
+                return onMethod(http.Method.OPTIONS, handle_fn);
+            }
+
+            pub fn trace(handle_fn: *const HandleFn) Route {
+                return onMethod(http.Method.TRACE, handle_fn);
+            }
         };
 
         pub const Next = union(enum) {
             middleware: MiddlewareNext,
             request_handler: RequestHandlerNext,
+
+            const MiddlewareNext = struct {
+                middleware: Middleware,
+                next: *const Next,
+
+                pub fn run(
+                    self: *const MiddlewareNext,
+                    ctx: *Context,
+                    request: *Request,
+                    response: *Response,
+                    cache: *Cache,
+                ) !void {
+                    try self.middleware.run(ctx, request, response, cache, self.next);
+                }
+            };
+
+            const RequestHandlerNext = struct {
+                routes: []const Route,
+
+                pub fn run(
+                    self: *const RequestHandlerNext,
+                    ctx: *Context,
+                    request: *Request,
+                    response: *Response,
+                    cache: *Cache,
+                ) !void {
+                    // Match the request method and invoke specific handler.
+                    // Lookup the type all handler.
+                    var type_all_route: ?Route = null;
+                    for (self.routes) |route| {
+                        switch (route.route_type) {
+                            .specific => {
+                                if (route.method == request.method) {
+                                    try @call(.{}, route.handle_fn, .{ ctx, request.*, response, cache });
+                                    break;
+                                }
+                            },
+                            .all => type_all_route = route,
+                        }
+                    } else {
+                        // Invoke the type all handler or throw error.
+                        if (type_all_route) |route| {
+                            try @call(.{}, route.handle_fn, .{ ctx, request.*, response, cache });
+                        } else {
+                            return Error.RouteNotFound;
+                        }
+                    }
+                }
+            };
 
             pub fn run(
                 self: *const Next,
@@ -51,152 +195,46 @@ pub fn Server(comptime Context: type, comptime Middleware: type) type {
             }
         };
 
-        const MiddlewareNext = struct {
-            middleware: *Middleware,
-            next: *const Next,
-
-            pub fn run(
-                self: *const MiddlewareNext,
-                ctx: *Context,
-                request: *Request,
-                response: *Response,
-                cache: *Cache,
-            ) !void {
-                try self.middleware.run(ctx, request, response, cache, self.next);
-            }
-        };
-
-        const RequestHandlerNext = struct {
-            handlers: []const Handler,
-
-            pub fn run(
-                self: *const RequestHandlerNext,
-                ctx: *Context,
-                request: *Request,
-                response: *Response,
-                cache: *Cache,
-            ) !void {
-                // Match the request method and invoke specific handler.
-                // Lookup the type all handler.
-                var not_found = true;
-                var type_all_handler: ?Handler = null;
-                for (self.handlers) |handler| {
-                    switch (handler.handler_type) {
-                        .specific => {
-                            if (handler.method == request.method) {
-                                not_found = false;
-                                try @call(.{}, handler.handle_fn, .{ ctx, request.*, response, cache });
-                            }
-                        },
-                        .all => type_all_handler = handler,
-                    }
-                }
-
-                // Invoke the type all handler or throw error.
-                if (not_found) {
-                    if (type_all_handler) |handler| {
-                        try @call(.{}, handler.handle_fn, .{ ctx, request.*, response, cache });
-                    } else {
-                        return Error.HandlerNotFound;
-                    }
-                }
-            }
-        };
-
-        pub fn init(allocator: mem.Allocator, max_request_size: usize) Self {
-            return .{
-                .allocator = allocator,
-                .max_request_size = max_request_size,
-                .middlewares = null,
-            };
-        }
-
         pub fn run(
-            self: *const Self,
+            allocator: mem.Allocator,
+            max_request_size: usize,
             context: *Context,
-            handlers: []const Handler,
+            middlewares: ?[]Middleware,
+            routes: []const Route,
         ) !void {
-            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            var arena = std.heap.ArenaAllocator.init(allocator);
             defer arena.deinit();
 
-            const middlewares_len = if (self.middlewares) |a| a.len else 0;
+            // Create middlewares pipeline if exist.
+            const middlewares_len = if (middlewares) |a| a.len else 0;
             var nexts = try arena.allocator().alloc(Next, middlewares_len + 1);
             for (nexts[0 .. nexts.len - 1]) |*a, i| {
                 a.* = .{
                     .middleware = .{
-                        .middleware = self.middlewares.?[i],
+                        .middleware = middlewares.?[i],
                         .next = &nexts[i + 1],
                     },
                 };
             }
+
+            // The last in the pipeline is always request handler.
             nexts[nexts.len - 1] = .{
                 .request_handler = .{
-                    .handlers = handlers,
+                    .routes = routes,
                 },
             };
 
             // Initialize Input and Output.
             var input: Input = undefined;
             var output: Output = undefined;
-            try Input.fromStdIn(arena.allocator(), self.max_request_size, &input);
+            try Input.fromStdIn(arena.allocator(), max_request_size, &input);
             try Output.init(arena.allocator(), &output);
 
+            // Run the pipeline.
             try nexts[0].run(context, &input.request, &output.response, &input.cache);
 
             // Write output to stdout.
             try output.toStdOut(&input.cache);
-        }
-
-        pub fn all(handle_fn: *const HandleFn) Handler {
-            return .{
-                .handle_fn = handle_fn,
-                .method = http.Method.GET,
-                .handler_type = .all,
-            };
-        }
-
-        pub fn onMethod(method: http.Method, handle_fn: *const HandleFn) Handler {
-            return .{
-                .handle_fn = handle_fn,
-                .method = method,
-                .handler_type = .specific,
-            };
-        }
-
-        pub fn get(handle_fn: *const HandleFn) Handler {
-            return onMethod(http.Method.GET, handle_fn);
-        }
-
-        pub fn post(handle_fn: *const HandleFn) Handler {
-            return onMethod(http.Method.POST, handle_fn);
-        }
-
-        pub fn put(handle_fn: *const HandleFn) Handler {
-            return onMethod(http.Method.PUT, handle_fn);
-        }
-
-        pub fn delete(handle_fn: *const HandleFn) Handler {
-            return onMethod(http.Method.DELETE, handle_fn);
-        }
-
-        pub fn head(handle_fn: *const HandleFn) Handler {
-            return onMethod(http.Method.HEAD, handle_fn);
-        }
-
-        pub fn patch(handle_fn: *const HandleFn) Handler {
-            return onMethod(http.Method.PATCH, handle_fn);
-        }
-
-        pub fn connect(handle_fn: *const HandleFn) Handler {
-            return onMethod(http.Method.CONNECT, handle_fn);
-        }
-
-        pub fn options(handle_fn: *const HandleFn) Handler {
-            return onMethod(http.Method.OPTIONS, handle_fn);
-        }
-
-        pub fn trace(handle_fn: *const HandleFn) Handler {
-            return onMethod(http.Method.TRACE, handle_fn);
         }
     };
 }
