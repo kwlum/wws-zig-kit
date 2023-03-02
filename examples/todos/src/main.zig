@@ -7,9 +7,6 @@ const mem = std.mem;
 
 const kit = @import("wws-zig-kit");
 
-const App = kit.App(Context);
-const Route = App.Route;
-
 const Context = struct {
     allocator: mem.Allocator,
 };
@@ -143,17 +140,18 @@ fn genNextId(allocator: mem.Allocator, cache: *kit.Cache) !u32 {
 }
 
 pub fn main() !void {
-    const routes = [_]Route{
-        Route.get(listTodos),
-        Route.post(createTodo),
-        Route.put(updateTodo),
-        Route.delete(deleteTodo),
-    };
-
     var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    var ctx: Context = .{ .allocator = allocator };
+    var context: Context = .{ .allocator = allocator };
+    const context_route = kit.Route.context(&context);
 
-    try App.run(std.heap.c_allocator, 65535, &ctx, null, &routes);
+    const routes = [_]kit.Route{
+        context_route.get(listTodos),
+        context_route.post(createTodo),
+        context_route.put(updateTodo),
+        context_route.delete(deleteTodo),
+    };
+
+    try kit.run(allocator, 65535, null, &routes);
 }
