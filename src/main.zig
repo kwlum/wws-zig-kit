@@ -6,200 +6,10 @@ const json = std.json;
 const mem = std.mem;
 
 pub const Error = error{
-    HandlerNotFound,
+    RouteNotFound,
 };
 
 pub const Params = std.StringHashMap([]const u8);
-
-const NoMiddleware = struct {
-    pub fn run(_: *const NoMiddleware, _: anytype, _: *Request, _: *Response, _: *Cache, _: anytype) !void {}
-};
-
-pub fn DefaultServer(comptime Context: type) type {
-    return Server(Context, NoMiddleware);
-}
-
-pub fn Server(comptime Context: type, comptime Middleware: type) type {
-    return struct {
-        allocator: mem.Allocator,
-        max_request_size: usize,
-        middlewares: ?[]*Middleware,
-
-        const Self = @This();
-        const HandleFn = fn (*Context, Request, *Response, *Cache) anyerror!void;
-
-        pub const Handler = struct {
-            handle_fn: *const HandleFn,
-            method: http.Method,
-            handler_type: enum { all, specific },
-        };
-
-        pub const Next = union(enum) {
-            middleware: MiddlewareNext,
-            request_handler: RequestHandlerNext,
-
-            pub fn run(
-                self: *const Next,
-                ctx: *Context,
-                request: *Request,
-                response: *Response,
-                cache: *Cache,
-            ) !void {
-                switch (self.*) {
-                    inline else => |s| try s.run(ctx, request, response, cache),
-                }
-            }
-        };
-
-        const MiddlewareNext = struct {
-            middleware: *Middleware,
-            next: *const Next,
-
-            pub fn run(
-                self: *const MiddlewareNext,
-                ctx: *Context,
-                request: *Request,
-                response: *Response,
-                cache: *Cache,
-            ) !void {
-                try self.middleware.run(ctx, request, response, cache, self.next);
-            }
-        };
-
-        const RequestHandlerNext = struct {
-            handlers: []const Handler,
-
-            pub fn run(
-                self: *const RequestHandlerNext,
-                ctx: *Context,
-                request: *Request,
-                response: *Response,
-                cache: *Cache,
-            ) !void {
-                // Match the request method and invoke specific handler.
-                // Lookup the type all handler.
-                var not_found = true;
-                var type_all_handler: ?Handler = null;
-                for (self.handlers) |handler| {
-                    switch (handler.handler_type) {
-                        .specific => {
-                            if (handler.method == request.method) {
-                                not_found = false;
-                                try @call(.{}, handler.handle_fn, .{ ctx, request.*, response, cache });
-                            }
-                        },
-                        .all => type_all_handler = handler,
-                    }
-                }
-
-                // Invoke the type all handler or throw error.
-                if (not_found) {
-                    if (type_all_handler) |handler| {
-                        try @call(.{}, handler.handle_fn, .{ ctx, request.*, response, cache });
-                    } else {
-                        return Error.HandlerNotFound;
-                    }
-                }
-            }
-        };
-
-        pub fn init(allocator: mem.Allocator, max_request_size: usize) Self {
-            return .{
-                .allocator = allocator,
-                .max_request_size = max_request_size,
-                .middlewares = null,
-            };
-        }
-
-        pub fn run(
-            self: *const Self,
-            context: *Context,
-            handlers: []const Handler,
-        ) !void {
-            var arena = std.heap.ArenaAllocator.init(self.allocator);
-            defer arena.deinit();
-
-            const middlewares_len = if (self.middlewares) |a| a.len else 0;
-            var nexts = try arena.allocator().alloc(Next, middlewares_len + 1);
-            for (nexts[0 .. nexts.len - 1]) |*a, i| {
-                a.* = .{
-                    .middleware = .{
-                        .middleware = self.middlewares.?[i],
-                        .next = &nexts[i + 1],
-                    },
-                };
-            }
-            nexts[nexts.len - 1] = .{
-                .request_handler = .{
-                    .handlers = handlers,
-                },
-            };
-
-            // Initialize Input and Output.
-            var input: Input = undefined;
-            var output: Output = undefined;
-            try Input.fromStdIn(arena.allocator(), self.max_request_size, &input);
-            try Output.init(arena.allocator(), &output);
-
-            try nexts[0].run(context, &input.request, &output.response, &input.cache);
-
-            // Write output to stdout.
-            try output.toStdOut(&input.cache);
-        }
-
-        pub fn all(handle_fn: *const HandleFn) Handler {
-            return .{
-                .handle_fn = handle_fn,
-                .method = http.Method.GET,
-                .handler_type = .all,
-            };
-        }
-
-        pub fn onMethod(method: http.Method, handle_fn: *const HandleFn) Handler {
-            return .{
-                .handle_fn = handle_fn,
-                .method = method,
-                .handler_type = .specific,
-            };
-        }
-
-        pub fn get(handle_fn: *const HandleFn) Handler {
-            return onMethod(http.Method.GET, handle_fn);
-        }
-
-        pub fn post(handle_fn: *const HandleFn) Handler {
-            return onMethod(http.Method.POST, handle_fn);
-        }
-
-        pub fn put(handle_fn: *const HandleFn) Handler {
-            return onMethod(http.Method.PUT, handle_fn);
-        }
-
-        pub fn delete(handle_fn: *const HandleFn) Handler {
-            return onMethod(http.Method.DELETE, handle_fn);
-        }
-
-        pub fn head(handle_fn: *const HandleFn) Handler {
-            return onMethod(http.Method.HEAD, handle_fn);
-        }
-
-        pub fn patch(handle_fn: *const HandleFn) Handler {
-            return onMethod(http.Method.PATCH, handle_fn);
-        }
-
-        pub fn connect(handle_fn: *const HandleFn) Handler {
-            return onMethod(http.Method.CONNECT, handle_fn);
-        }
-
-        pub fn options(handle_fn: *const HandleFn) Handler {
-            return onMethod(http.Method.OPTIONS, handle_fn);
-        }
-
-        pub fn trace(handle_fn: *const HandleFn) Handler {
-            return onMethod(http.Method.TRACE, handle_fn);
-        }
-    };
-}
 
 pub const Request = struct {
     method: http.Method,
@@ -263,6 +73,474 @@ pub const Headers = struct {
     }
 };
 
+pub const Route = union(enum) {
+    fn_route: FnRoute,
+    custom_route: CustomRoute,
+    context_route: ContextFnRoute,
+
+    const RouteType = enum { all, specific };
+    const HandleFn = fn (Request, *Response, *Cache) anyerror!void;
+
+    pub fn custom(http_method: http.Method, handler: anytype) Route {
+        return .{ .custom_route = CustomRoute.init(.specific, http_method, handler) };
+    }
+
+    pub fn allCustom(handler: anytype) Route {
+        return .{ .custom_route = CustomRoute.init(.all, .GET, handler) };
+    }
+
+    pub fn context(ctx: anytype) ContextRoute(@typeInfo(@TypeOf(ctx)).Pointer.child) {
+        const C = @TypeOf(ctx);
+        const c_info = @typeInfo(C);
+
+        if (c_info != .Pointer) @compileError("ctx is not Pointer.");
+
+        return ContextRoute(c_info.Pointer.child).init(ctx);
+    }
+
+    pub fn on(http_method: http.Method, handle_fn: *const HandleFn) Route {
+        return .{ .fn_route = .{
+            .route_type = .specific,
+            .method_type = http_method,
+            .handle_fn = handle_fn,
+        } };
+    }
+
+    pub fn all(handle_fn: *const HandleFn) Route {
+        return .{ .fn_route = .{
+            .route_type = .all,
+            .method_type = .GET,
+            .handle_fn = handle_fn,
+        } };
+    }
+
+    pub fn get(handle_fn: *const HandleFn) Route {
+        return on(.GET, handle_fn);
+    }
+
+    pub fn post(handle_fn: *const HandleFn) Route {
+        return on(.POST, handle_fn);
+    }
+
+    pub fn put(handle_fn: *const HandleFn) Route {
+        return on(.PUT, handle_fn);
+    }
+
+    pub fn delete(handle_fn: *const HandleFn) Route {
+        return on(.DELETE, handle_fn);
+    }
+
+    pub fn head(handle_fn: *const HandleFn) Route {
+        return on(.HEAD, handle_fn);
+    }
+
+    pub fn patch(handle_fn: *const HandleFn) Route {
+        return on(.PATCH, handle_fn);
+    }
+
+    pub fn connect(handle_fn: *const HandleFn) Route {
+        return on(.CONNECT, handle_fn);
+    }
+
+    pub fn options(handle_fn: *const HandleFn) Route {
+        return on(.OPTIONS, handle_fn);
+    }
+
+    pub fn trace(handle_fn: *const HandleFn) Route {
+        return on(.TRACE, handle_fn);
+    }
+
+    fn method(self: *const Route) http.Method {
+        switch (self.*) {
+            inline else => |s| return s.method(),
+        }
+    }
+
+    fn routeType(self: *const Route) RouteType {
+        switch (self.*) {
+            inline else => |s| return s.routeType(),
+        }
+    }
+
+    fn handle(
+        self: *const Route,
+        request: Request,
+        response: *Response,
+        cache: *Cache,
+    ) !void {
+        switch (self.*) {
+            inline else => |*s| try s.handle(request, response, cache),
+        }
+    }
+
+    const FnRoute = struct {
+        route_type: RouteType,
+        method_type: http.Method,
+        handle_fn: *const HandleFn,
+
+        fn handle(
+            self: *const FnRoute,
+            request: Request,
+            response: *Response,
+            cache: *Cache,
+        ) !void {
+            try self.handle_fn(request, response, cache);
+        }
+
+        fn method(self: *const FnRoute) http.Method {
+            return self.method_type;
+        }
+
+        fn routeType(self: *const FnRoute) RouteType {
+            return self.route_type;
+        }
+    };
+
+    fn ContextRoute(comptime T: type) type {
+        return struct {
+            context: *T,
+
+            const Self = @This();
+            const ContextHandleFnPtr = *const fn (*T, Request, *Response, *Cache) anyerror!void;
+
+            fn init(ctx: *T) ContextRoute(T) {
+                return .{
+                    .context = ctx,
+                };
+            }
+
+            pub fn on(self: Self, http_method: http.Method, handle_fn: ContextHandleFnPtr) Route {
+                return .{
+                    .context_route = ContextFnRoute.init(T, self.context, .specific, http_method, handle_fn),
+                };
+            }
+
+            pub fn all(self: Self, handle_fn: ContextHandleFnPtr) Route {
+                return .{
+                    .context_route = ContextFnRoute.init(T, self.context, .all, .GET, handle_fn),
+                };
+            }
+
+            pub fn get(self: Self, handle_fn: ContextHandleFnPtr) Route {
+                return self.on(.GET, handle_fn);
+            }
+
+            pub fn post(self: Self, handle_fn: ContextHandleFnPtr) Route {
+                return self.on(.POST, handle_fn);
+            }
+
+            pub fn put(self: Self, handle_fn: ContextHandleFnPtr) Route {
+                return self.on(.PUT, handle_fn);
+            }
+
+            pub fn delete(self: Self, handle_fn: ContextHandleFnPtr) Route {
+                return self.on(.DELETE, handle_fn);
+            }
+
+            pub fn head(self: Self, handle_fn: ContextHandleFnPtr) Route {
+                return self.on(.HEAD, handle_fn);
+            }
+
+            pub fn patch(self: Self, handle_fn: ContextHandleFnPtr) Route {
+                return self.on(.PATCH, handle_fn);
+            }
+
+            pub fn connect(self: Self, handle_fn: ContextHandleFnPtr) Route {
+                return self.on(.CONNECT, handle_fn);
+            }
+
+            pub fn options(self: Self, handle_fn: ContextHandleFnPtr) Route {
+                return self.on(.OPTIONS, handle_fn);
+            }
+
+            pub fn trace(self: Self, handle_fn: ContextHandleFnPtr) Route {
+                return self.on(.TRACE, handle_fn);
+            }
+        };
+    }
+
+    const ContextFnRoute = struct {
+        route_type: RouteType,
+        method_type: http.Method,
+        handle_fn: *const fn (*anyopaque, *const fn () void, Request, *Response, *Cache) anyerror!void,
+        context: *anyopaque,
+        fn_ptr: *const fn () void,
+
+        fn init(
+            comptime T: type,
+            ctx: *T,
+            route_type: RouteType,
+            http_method: http.Method,
+            handle_fn: *const fn (*T, Request, *Response, *Cache) anyerror!void,
+        ) ContextFnRoute {
+            const alignment = @typeInfo(@TypeOf(ctx)).Pointer.alignment;
+
+            const S = struct {
+                pub fn handle(
+                    ptr: *anyopaque,
+                    fn_ptr: *const fn () void,
+                    request: Request,
+                    response: *Response,
+                    cache: *Cache,
+                ) !void {
+                    const s_ctx = if (alignment >= 1)
+                        @ptrCast(*T, @alignCast(alignment, ptr))
+                    else
+                        @ptrCast(*T, ptr);
+
+                    const handler = @ptrCast(*const fn (*T, Request, *Response, *Cache) anyerror!void, fn_ptr);
+
+                    try @call(.{}, handler, .{ s_ctx, request, response, cache });
+                }
+            };
+
+            return .{
+                .route_type = route_type,
+                .method_type = http_method,
+                .context = ctx,
+                .handle_fn = S.handle,
+                .fn_ptr = @ptrCast(*const fn () void, handle_fn),
+            };
+        }
+
+        fn handle(
+            self: *const ContextFnRoute,
+            request: Request,
+            response: *Response,
+            cache: *Cache,
+        ) !void {
+            try self.handle_fn(self.context, self.fn_ptr, request, response, cache);
+        }
+
+        fn method(self: *const ContextFnRoute) http.Method {
+            return self.method_type;
+        }
+
+        fn routeType(self: *const ContextFnRoute) RouteType {
+            return self.route_type;
+        }
+    };
+
+    const CustomRoute = struct {
+        route_type: RouteType,
+        method_type: http.Method,
+        ptr: *anyopaque,
+        handle_fn: *const fn (*anyopaque, Request, *Response, *Cache) anyerror!void,
+
+        fn init(route_type: RouteType, http_method: http.Method, route: anytype) CustomRoute {
+            const R = @TypeOf(route);
+            const r_info = @typeInfo(R);
+
+            if (r_info != .Pointer) @compileError("route is not pointer.");
+            if (r_info.Pointer.size != .One) @compileError("route is not single item pointer.");
+
+            const alignment = r_info.Pointer.alignment;
+
+            const S = struct {
+                pub fn handle(
+                    ptr: *anyopaque,
+                    request: Request,
+                    response: *Response,
+                    cache: *Cache,
+                ) !void {
+                    const self = if (alignment >= 1)
+                        @ptrCast(R, @alignCast(alignment, ptr))
+                    else
+                        @ptrCast(R, ptr);
+
+                    try @call(.{}, r_info.Pointer.child.handle, .{
+                        self,
+                        request,
+                        response,
+                        cache,
+                    });
+                }
+            };
+
+            return .{
+                .route_type = route_type,
+                .method_type = http_method,
+                .ptr = route,
+                .handle_fn = S.handle,
+            };
+        }
+
+        fn handle(
+            self: *const CustomRoute,
+            request: Request,
+            response: *Response,
+            cache: *Cache,
+        ) !void {
+            try self.handle_fn(self.ptr, request, response, cache);
+        }
+
+        fn method(self: *const CustomRoute) http.Method {
+            return self.method_type;
+        }
+
+        fn routeType(self: *const CustomRoute) RouteType {
+            return self.route_type;
+        }
+    };
+};
+
+pub const Middleware = struct {
+    ptr: *anyopaque,
+    run_fn: *const fn (*anyopaque, *Request, *Response, *Cache, *const Pipeline) anyerror!void,
+
+    pub fn init(middleware: anytype) Middleware {
+        const M = @TypeOf(middleware);
+        const m_info = @typeInfo(M);
+
+        if (m_info != .Pointer) @compileError("middleware is not pointer.");
+        if (m_info.Pointer.size != .One) @compileError("middleware is not single item pointer.");
+
+        const alignment = m_info.Pointer.alignment;
+
+        const S = struct {
+            pub fn run(
+                ptr: *anyopaque,
+                request: *Request,
+                response: *Response,
+                cache: *Cache,
+                pipeline: *const Pipeline,
+            ) !void {
+                const self = if (alignment >= 1)
+                    @ptrCast(M, @alignCast(alignment, ptr))
+                else
+                    @ptrCast(M, ptr);
+
+                try @call(.{}, m_info.Pointer.child.run, .{
+                    self,
+                    request,
+                    response,
+                    cache,
+                    pipeline,
+                });
+            }
+        };
+
+        return .{
+            .ptr = middleware,
+            .run_fn = S.run,
+        };
+    }
+
+    pub fn run(
+        self: Middleware,
+        request: *Request,
+        response: *Response,
+        cache: *Cache,
+        pipeline: *const Pipeline,
+    ) !void {
+        try self.run_fn(self.ptr, request, response, cache, pipeline);
+    }
+};
+
+pub const Pipeline = union(enum) {
+    middleware: MiddlewareNode,
+    request_handler: RequestHandlerNode,
+
+    const MiddlewareNode = struct {
+        middleware: Middleware,
+        pipeline: *const Pipeline,
+
+        pub fn run(
+            self: *const MiddlewareNode,
+            request: *Request,
+            response: *Response,
+            cache: *Cache,
+        ) !void {
+            try self.middleware.run(request, response, cache, self.pipeline);
+        }
+    };
+
+    const RequestHandlerNode = struct {
+        routes: []const Route,
+
+        pub fn run(
+            self: *const RequestHandlerNode,
+            request: *Request,
+            response: *Response,
+            cache: *Cache,
+        ) !void {
+            // Match the request method and invoke specific handler.
+            // Lookup the type all handler.
+            var type_all_route: ?*const Route = null;
+            for (self.routes) |*route| {
+                switch (route.routeType()) {
+                    .specific => {
+                        if (route.method() == request.method) {
+                            try route.handle(request.*, response, cache);
+                            break;
+                        }
+                    },
+                    .all => type_all_route = route,
+                }
+            } else {
+                // Invoke the type all handler or throw error.
+                if (type_all_route) |route| {
+                    try route.handle(request.*, response, cache);
+                } else {
+                    return Error.RouteNotFound;
+                }
+            }
+        }
+    };
+
+    pub fn next(
+        self: *const Pipeline,
+        request: *Request,
+        response: *Response,
+        cache: *Cache,
+    ) !void {
+        switch (self.*) {
+            inline else => |s| try s.run(request, response, cache),
+        }
+    }
+};
+
+pub fn run(
+    allocator: mem.Allocator,
+    max_request_size: usize,
+    middlewares: ?[]Middleware,
+    routes: []const Route,
+) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    // Create middlewares pipeline if exist.
+    const middlewares_len = if (middlewares) |a| a.len else 0;
+    var pipeline = try arena.allocator().alloc(Pipeline, middlewares_len + 1);
+    for (pipeline[0 .. pipeline.len - 1]) |*a, i| {
+        a.* = .{
+            .middleware = .{
+                .middleware = middlewares.?[i],
+                .pipeline = &pipeline[i + 1],
+            },
+        };
+    }
+
+    // The last in the pipeline is always request handler.
+    pipeline[pipeline.len - 1] = .{
+        .request_handler = .{
+            .routes = routes,
+        },
+    };
+
+    // Initialize Input and Output.
+    var input: Input = undefined;
+    var output: Output = undefined;
+    try Input.fromStdIn(arena.allocator(), max_request_size, &input);
+    try Output.init(arena.allocator(), &output);
+
+    // Run the pipeline.
+    try pipeline[0].next(&input.request, &output.response, &input.cache);
+
+    // Write output to stdout.
+    try output.toStdOut(&input.cache);
+}
+
 // Internal IO structures.
 const Input = struct {
     request: Request,
@@ -287,7 +565,7 @@ const Input = struct {
         const request_path = if (json_tree.root.Object.get("url")) |a| a.String else "/";
         const request_body = if (json_tree.root.Object.get("body")) |a| a.String else "";
         input.request = .{
-            .method = http.Method.GET,
+            .method = .GET,
             .headers = Headers.init(allocator),
             .params = Params.init(allocator),
             .path = request_path,
@@ -319,23 +597,23 @@ const Input = struct {
             "get";
 
         if (mem.eql(u8, method_string, "get")) {
-            input.request.method = http.Method.GET;
+            input.request.method = .GET;
         } else if (mem.eql(u8, method_string, "head")) {
-            input.request.method = http.Method.HEAD;
+            input.request.method = .HEAD;
         } else if (mem.eql(u8, method_string, "post")) {
-            input.request.method = http.Method.POST;
+            input.request.method = .POST;
         } else if (mem.eql(u8, method_string, "put")) {
-            input.request.method = http.Method.PUT;
+            input.request.method = .PUT;
         } else if (mem.eql(u8, method_string, "delete")) {
-            input.request.method = http.Method.DELETE;
+            input.request.method = .DELETE;
         } else if (mem.eql(u8, method_string, "connect")) {
-            input.request.method = http.Method.CONNECT;
+            input.request.method = .CONNECT;
         } else if (mem.eql(u8, method_string, "options")) {
-            input.request.method = http.Method.OPTIONS;
+            input.request.method = .OPTIONS;
         } else if (mem.eql(u8, method_string, "trace")) {
-            input.request.method = http.Method.TRACE;
+            input.request.method = .TRACE;
         } else if (mem.eql(u8, method_string, "patch")) {
-            input.request.method = http.Method.PATCH;
+            input.request.method = .PATCH;
         }
     }
 };

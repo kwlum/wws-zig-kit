@@ -16,12 +16,12 @@ pub fn build(b: *std.build.Builder) void {
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall.
     const mode = b.standardReleaseOptions();
 
-    const exe = b.addExecutable("echo", "src/main.zig");
+    const exe = b.addExecutable("counter", "src/main.zig");
     exe.setTarget(target);
     exe.setBuildMode(mode);
     exe.addPackagePath("wws-zig-kit", "../../src/main.zig");
     exe.linkLibC();
     exe.install();
 
-    b.getInstallStep().dependOn(&b.addInstallFileWithDir(.{ .path = "./zig-out/bin/echo.wasm" }, .prefix, "../www/echo.wasm").step);
+    b.getInstallStep().dependOn(&b.addInstallFileWithDir(.{ .path = "./zig-out/bin/counter.wasm" }, .prefix, "../www/counter.wasm").step);
 }

@@ -4,76 +4,85 @@ const time = std.time;
 
 const kit = @import("wws-zig-kit");
 
-const App = kit.Server(Context, Middleware);
-
 const Context = struct {
     request_time: i64 = 0,
 };
 
-const Middleware = union(enum) {
-    request_time: RequestTimeMiddleware,
-    set_cookie: SetCookieMiddleware,
-
-    pub fn run(
-        self: *Middleware,
-        ctx: *Context,
-        req: *kit.Request,
-        res: *kit.Response,
-        cache: *kit.Cache,
-        next: *const App.Next,
-    ) !void {
-        switch (self.*) {
-            inline else => |*s| try s.run(ctx, req, res, cache, next),
-        }
-    }
-};
-
 const RequestTimeMiddleware = struct {
+    context: *Context,
+
     pub fn run(
-        _: *RequestTimeMiddleware,
-        ctx: *Context,
+        self: *RequestTimeMiddleware,
         req: *kit.Request,
         res: *kit.Response,
         cache: *kit.Cache,
-        next: *const App.Next,
+        pipeline: *const kit.Pipeline,
     ) anyerror!void {
-        ctx.request_time = time.timestamp();
-        try next.run(ctx, req, res, cache);
+        self.context.request_time = time.timestamp();
+        try pipeline.next(req, res, cache);
     }
 };
 
 const SetCookieMiddleware = struct {
+    context: *Context,
+    name: []const u8,
+
     pub fn run(
-        _: *SetCookieMiddleware,
-        ctx: *Context,
+        self: *SetCookieMiddleware,
         req: *kit.Request,
         res: *kit.Response,
         cache: *kit.Cache,
-        next: *const App.Next,
+        pipeline: *const kit.Pipeline,
     ) anyerror!void {
-        try next.run(ctx, req, res, cache);
+        try pipeline.next(req, res, cache);
         var buf: [128]u8 = undefined;
-        const s = try std.fmt.bufPrint(&buf, "server-timestamp={d}", .{ctx.request_time});
+        const s = try std.fmt.bufPrint(&buf, "{s}={d}", .{ self.name, self.context.request_time });
         try res.headers.put("set-cookie", s);
     }
 };
 
-fn handle(ctx: *Context, _: kit.Request, response: *kit.Response, _: *kit.Cache) !void {
+const GetHandler = struct {
+    context: *Context,
+
+    pub fn handle(
+        self: *GetHandler,
+        _: kit.Request,
+        response: *kit.Response,
+        _: *kit.Cache,
+    ) !void {
+        try response.headers.put("content-type", "text/plain");
+        try response.body.print("Request-Time: {d}", .{self.context.request_time});
+        response.status = http.Status.ok;
+    }
+};
+
+pub fn handle(
+    context: *Context,
+    _: kit.Request,
+    response: *kit.Response,
+    _: *kit.Cache,
+) !void {
     try response.headers.put("content-type", "text/plain");
-    try response.body.print("Request-Time: {d}", .{ctx.request_time});
+    try response.body.print("The Request-Time: {d}", .{context.request_time});
     response.status = http.Status.ok;
 }
 
 pub fn main() !void {
-    var app = App.init(std.heap.c_allocator, 65535);
-    var request_time_middleware = Middleware{ .request_time = RequestTimeMiddleware{} };
-    var set_cookie_middleware = Middleware{ .request_time = RequestTimeMiddleware{} };
-    var middlewares = [_]*Middleware{
-        &request_time_middleware,
-        &set_cookie_middleware,
+    var context: Context = .{};
+    var request_time_middleware: RequestTimeMiddleware = .{
+        .context = &context,
     };
-    app.middlewares = &middlewares;
-    const handlers = [_]App.Handler{App.get(handle)};
-    var context = Context{};
-    try app.run(&context, &handlers);
+    var set_cookie_middleware: SetCookieMiddleware = .{
+        .context = &context,
+        .name = "x-timestamp",
+    };
+    var middlewares = [_]kit.Middleware{
+        kit.Middleware.init(&request_time_middleware),
+        kit.Middleware.init(&set_cookie_middleware),
+    };
+
+    const routes = [_]kit.Route{
+        kit.Route.context(&context).get(handle),
+    };
+    try kit.run(std.heap.c_allocator, 65535, &middlewares, &routes);
 }
